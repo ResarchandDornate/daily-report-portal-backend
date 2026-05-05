@@ -8,3 +8,13 @@ email-validator==2.2.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.20
+
+# DB migrations (replaces Django migrations once Phase 3 lands)
+alembic==1.14.0
+
+# Admin UI mounted at /admin (replaces Django admin once Phase 3 lands)
+sqladmin==0.20.1
+itsdangerous==2.2.0
+
+# Reads HR roster Excel files in scripts/import_employees.py
+openpyxl==3.1.5
