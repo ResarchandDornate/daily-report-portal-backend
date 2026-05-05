@@ -32,24 +32,6 @@ services:
     depends_on:
       - postgres
 
-  django:
-    build: ./django_app
-    container_name: drp_django
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./django_app:/app
-    ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command: >
-      sh -c "python manage.py makemigrations users departments reports &&
-             python manage.py migrate &&
-             python manage.py shell -c \"from django.contrib.auth import get_user_model; U=get_user_model(); U.objects.filter(username='${DJANGO_SUPERUSER_USERNAME}').exists() or U.objects.create_superuser('${DJANGO_SUPERUSER_USERNAME}','${DJANGO_SUPERUSER_EMAIL}','${DJANGO_SUPERUSER_PASSWORD}')\" &&
-             python manage.py runserver 0.0.0.0:8000"
-
   fastapi:
     build: ./fastapi_app
     container_name: drp_fastapi
@@ -62,9 +44,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      django:
-        condition: service_started
-    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    # On every start, in order:
+    #   1. bootstrap_alembic.py — stamp head if the schema exists but alembic
+    #      doesn't know yet (only on the very first run after Django removal).
+    #   2. alembic upgrade head — apply any pending migrations.  No-op if at head.
+    #   3. bootstrap_admin.py — ensure the HR superuser exists.  Idempotent.
+    #   4. uvicorn — actually serve the app.
+    command: >
+      sh -c "python -m scripts.bootstrap_alembic &&
+             alembic upgrade head &&
+             python -m scripts.bootstrap_admin &&
+             exec uvicorn main:app --host 0.0.0.0 --port 8001 --reload"
 
 volumes:
   postgres_data:

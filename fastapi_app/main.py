@@ -1,15 +1,21 @@
-"""FastAPI entrypoint — JSON API for the Daily Report Portal frontend."""
+"""FastAPI entrypoint — JSON API + SQLAdmin for the Daily Report Portal."""
 import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from admin import setup_admin
+import model_events  # noqa: F401 -- registers SQLAlchemy event listeners on import
 from routers import auth, departments, reports, users
 
 app = FastAPI(
     title="Daily Report Portal API",
-    description="JSON API for the Ornate Solar Daily Report Portal. "
-                "Schema is owned by the sibling Django service (see /admin on :8000).",
+    description=(
+        "JSON API for the Ornate Solar Daily Report Portal.\n\n"
+        "- Frontend (Next.js) talks to this API via /api/*\n"
+        "- HR can manage data at /admin (SQLAdmin) using their dashboard credentials\n"
+        "- During the migration window, Django admin at :8000/admin still works too"
+    ),
     version="0.1.0",
 )
 
@@ -45,3 +51,8 @@ app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(departments.router)
 app.include_router(reports.router)
+
+
+# Mount SQLAdmin at /admin — authenticated via the same email/password as the
+# dashboard.  Only HR superusers can reach it (see admin.py for the gate).
+setup_admin(app)
