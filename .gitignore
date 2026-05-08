@@ -41,3 +41,7 @@ postgres-data/
 
 # HR roster — real employee data, kept out of version control
 *.xlsx
+
+# Postgres data dumps (real PII — transfer manually, not via git)
+*.sql
+*.dump
