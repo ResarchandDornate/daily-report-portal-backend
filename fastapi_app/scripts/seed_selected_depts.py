@@ -22,6 +22,57 @@ from models import DailyReport, Department, User  # noqa: E402
 DAYS_BACK = 7
 
 FIELD_SAMPLES: dict[str, list[str]] = {
+    # ---- Generic 5-field template (BESS Sales, Design, Finance, HR, O&M,
+    # Production, Project, R&D, R&D-BESS, Service, Support, Web Dev) ----
+    "workDone": [
+        "Completed module specs.",
+        "Closed 3 customer tickets.",
+        "Reconciled April invoices.",
+        "Drafted Q2 budget sheet.",
+        "Finished daily QC pass.",
+        "Reviewed inverter datasheets.",
+        "Updated rooftop layout for Coimbatore site.",
+        "Kicked off Bhopal install.",
+    ],
+    "workInProgress": [
+        "Reviewing supplier datasheets.",
+        "Refactoring auth flow.",
+        "Tracking pending shipment.",
+        "QA pass on dashboard module.",
+        "Drafting site SOP.",
+        "Checking BoM for Pune project.",
+        "Following up on cable RFQ.",
+        "Auditing weekly leads.",
+    ],
+    "upcomingPriorities": [
+        "Prototype testing on Friday.",
+        "GST filing on 25th.",
+        "Inventory audit Monday.",
+        "Site visit on Thursday.",
+        "Vendor evaluation next week.",
+        "Tender deadline on 5th.",
+        "Board review prep.",
+        "Client demo on 12th.",
+    ],
+    "challenges": [
+        "Awaiting approval on BoM revision.",
+        "Pending PO numbers.",
+        "Need staging DB credentials.",
+        "Truck breakdown delayed Friday delivery.",
+        "Vendor X payment held up.",
+        "Material delayed at Mundra port.",
+        "Site team short on hands.",
+        "—",
+    ],
+    "otherUpdate": [
+        "Attended weekly sync.",
+        "Onboarded new intern.",
+        "—",
+        "CRM cleanup completed.",
+        "Filed expense claims.",
+        "Refreshed lead-pipeline doc.",
+    ],
+
     # ---- Sales ----
     "meeting": [
         "Met 2 EPC partners in Pune.",
