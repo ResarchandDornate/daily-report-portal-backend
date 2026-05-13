@@ -74,6 +74,16 @@ class DepartmentOut(BaseModel):
 class ReportIn(BaseModel):
     date: date
     data: dict[str, str] = {}
+    # Optional override — only HR users may set this to submit on behalf of
+    # another employee.  Non-HR callers must leave it null (default).
+    user_id: int | None = None
+
+
+class LeaveIn(BaseModel):
+    start_date: date
+    days: int = 1
+    reason: str = ""
+    user_id: int | None = None  # HR-only: apply leave on behalf of another
 
 
 class ReportOut(BaseModel):
@@ -85,6 +95,13 @@ class ReportOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ReportListOut(BaseModel):
+    items: list[ReportOut]
+    total: int
+    limit: int
+    offset: int
 
 
 TokenResponse.model_rebuild()

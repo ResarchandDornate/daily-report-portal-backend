@@ -36,6 +36,21 @@ def main() -> None:
 
     db = SessionLocal()
     try:
+        # If ANY HR superuser exists (e.g. a real CEO / HR Manager set up via the
+        # admin UI), don't recreate the bootstrap "admin" account.  This stops
+        # the seed admin from resurrecting after it's been deleted in prod.
+        any_hr_superuser = (
+            db.query(User)
+            .filter(User.role == "hr", User.is_superuser.is_(True))
+            .first()
+        )
+        if any_hr_superuser:
+            print(
+                f"[bootstrap_admin] HR superuser {any_hr_superuser.username!r} "
+                f"already exists — skipping bootstrap admin creation."
+            )
+            return
+
         # Match by either username or email — covers admins created by either
         # path during the migration window.
         existing = (
