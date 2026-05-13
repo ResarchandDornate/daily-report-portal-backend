@@ -11,7 +11,7 @@ Re-running is safe — upserts on (user_id, date).  By default seeds the last
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Make `from auth import ...` etc. resolvable when run as a module.
@@ -68,6 +68,9 @@ def _pick(key: str, idx: int) -> str:
 
 def main() -> None:
     today = date.today()
+    # Django created the table without DB-level DEFAULTs on submitted_at /
+    # created_at, so we set them explicitly per row.
+    now = datetime.now(timezone.utc)
     db = SessionLocal()
     try:
         employees = (
@@ -108,8 +111,15 @@ def main() -> None:
                 )
                 if existing:
                     existing.data = data
+                    existing.submitted_at = now
                 else:
-                    db.add(DailyReport(user_id=emp.id, date=d, data=data))
+                    db.add(DailyReport(
+                        user_id=emp.id,
+                        date=d,
+                        data=data,
+                        submitted_at=now,
+                        created_at=now,
+                    ))
                 upserts += 1
 
         db.commit()
