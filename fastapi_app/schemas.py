@@ -69,6 +69,49 @@ class DepartmentOut(BaseModel):
         from_attributes = True
 
 
+class DepartmentCreate(BaseModel):
+    slug: str
+    name: str
+    color: str = "zinc"
+    report_fields: list[FieldDef] = []
+
+
+class DepartmentUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    report_fields: Optional[list[FieldDef]] = None
+
+
+class EmployeeCreate(BaseModel):
+    email: EmailStr
+    username: Optional[str] = None  # defaults to local part of email
+    password: Optional[str] = None  # defaults to "<firstname>@ornate" pattern
+    first_name: str
+    last_name: str = ""
+    department: Optional[str] = None  # slug
+    title: str = ""
+    contact_number: str = ""
+    role: str = "employee"  # "employee" | "hr"
+    organisation: str = ""
+    reporting_manager: str = ""
+    date_of_joining: Optional[date] = None
+
+
+class EmployeeUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    department: Optional[str] = None  # slug, or "" to unset
+    title: Optional[str] = None
+    contact_number: Optional[str] = None
+    role: Optional[str] = None
+    organisation: Optional[str] = None
+    reporting_manager: Optional[str] = None
+    date_of_joining: Optional[date] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = None  # set only if HR wants to reset
+
+
 # ---------- Daily Report ----------
 
 class ReportIn(BaseModel):
