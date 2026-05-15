@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(sh scripts/dump_seed.sh)"
+      "Bash(sh scripts/dump_seed.sh)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }

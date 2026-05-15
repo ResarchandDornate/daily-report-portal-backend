@@ -1,0 +1,20 @@
+name: Deploy Daily Report API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-daily-report-api
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: Ornate-solar-resarchd/portals-infra/.github/workflows/_deploy-template.yml@main
+    with:
+      portal:       daily-report-api
+      portal_dir:   daily-report-backend
+      services:     "daily-report-api"
+      health_url:   "https://daily-report-api.unityess.cloud/"
+      runner_label: daily-report-api
