@@ -23,6 +23,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     UniqueConstraint,
     text,
@@ -161,3 +162,50 @@ class DailyReport(Base):
 
     def __repr__(self) -> str:
         return f"<DailyReport id={self.id} user_id={self.user_id} date={self.date}>"
+
+
+class SalesUpload(Base):
+    """One uploaded Excel sheet (weekly / monthly calling log).
+
+    The file itself lives in MinIO; this row carries the metadata and a
+    parsed summary so the dashboard can render a preview without re-parsing
+    the bytes every time.
+    """
+
+    __tablename__ = "sales_uploads"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users_user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    period_type = Column(
+        String(16), nullable=False, default="weekly", server_default="weekly"
+    )  # "weekly" | "monthly" | "adhoc"
+    period_start = Column(Date, nullable=True)
+    period_end = Column(Date, nullable=True)
+    note = Column(String(512), nullable=False, default="", server_default="")
+    original_filename = Column(String(255), nullable=False)
+    minio_object_key = Column(String(512), nullable=False, unique=True)
+    file_size_bytes = Column(Integer, nullable=False, default=0, server_default="0")
+    # Parsed summary from openpyxl — columns, row count, optional totals.
+    parsed_summary = Column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    uploaded_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    user = relationship("User")
+
+    __table_args__ = (
+        Index("ix_sales_uploads_user_uploaded_at", "user_id", "uploaded_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SalesUpload id={self.id} user_id={self.user_id} "
+            f"file={self.original_filename!r}>"
+        )

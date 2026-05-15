@@ -147,5 +147,24 @@ class ReportListOut(BaseModel):
     offset: int
 
 
+# ---------- Sales Uploads (Inside Sales weekly/monthly Excel) ----------
+
+class SalesUploadOut(BaseModel):
+    id: int
+    user_id: int
+    user_name: str = ""
+    period_type: str
+    period_start: Optional[date] = None
+    period_end: Optional[date] = None
+    note: str = ""
+    original_filename: str
+    file_size_bytes: int
+    parsed_summary: dict = {}
+    uploaded_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 TokenResponse.model_rebuild()
 UserOut.model_rebuild()
