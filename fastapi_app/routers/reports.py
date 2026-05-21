@@ -80,14 +80,10 @@ def upsert_report(
 
     now = datetime.now(timezone.utc)
     if existing:
-        # Employees submit-once policy: only HR can overwrite an existing
-        # report.  Regular employees who try to "edit" by re-submitting for a
-        # past date get a 403.  HR users editing their own reports are allowed.
-        if user.role != "hr":
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "A report already exists for this date. Contact HR to edit it.",
-            )
+        # Employees can now edit their OWN past reports.  HR can edit anyone's
+        # (the HR-on-behalf-of override earlier in this function is already
+        # gated to HR-only, so non-HR callers can only ever touch their own
+        # row).
         existing.data = payload.data
         existing.submitted_at = now
         report = existing
