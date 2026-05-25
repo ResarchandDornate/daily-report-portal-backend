@@ -164,6 +164,35 @@ class DailyReport(Base):
         return f"<DailyReport id={self.id} user_id={self.user_id} date={self.date}>"
 
 
+class Organisation(Base):
+    """Master list of organisations HR can pick from when adding employees.
+
+    Currently `User.organisation` is a free-text column carrying the same
+    value as `Organisation.name`.  This table just enables central
+    management — add / rename / delete — without needing every employee
+    row to be updated when an organisation's name changes (renames are
+    a follow-up via UPDATE if needed).
+    """
+
+    __tablename__ = "organisations"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(64), unique=True, nullable=False)
+    color = Column(String(16), nullable=False, default="zinc", server_default="zinc")
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Organisation name={self.name!r}>"
+
+
 class SalesUpload(Base):
     """One uploaded Excel sheet (weekly / monthly calling log).
 

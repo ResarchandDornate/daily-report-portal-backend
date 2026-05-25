@@ -69,6 +69,25 @@ class DepartmentOut(BaseModel):
         from_attributes = True
 
 
+class OrganisationOut(BaseModel):
+    id: int
+    name: str
+    color: str = "zinc"
+
+    class Config:
+        from_attributes = True
+
+
+class OrganisationCreate(BaseModel):
+    name: str
+    color: str = "zinc"
+
+
+class OrganisationUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+
+
 class DepartmentCreate(BaseModel):
     slug: str
     name: str
