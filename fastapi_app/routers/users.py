@@ -105,6 +105,7 @@ def create_employee(
         is_superuser=(payload.role == "hr"),
         is_staff=(payload.role == "hr"),
         is_active=True,
+        is_team_head=bool(payload.is_team_head),
         title=(payload.title or "").strip(),
         contact_number=(payload.contact_number or "").strip(),
         department_id=dept.id if dept else None,
@@ -158,6 +159,7 @@ def update_employee(
     for field in (
         "first_name", "last_name", "email", "title", "contact_number",
         "organisation", "reporting_manager", "date_of_joining", "is_active",
+        "is_team_head",
     ):
         if field in data:
             value = data[field]

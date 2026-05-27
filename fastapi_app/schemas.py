@@ -41,6 +41,7 @@ class UserOut(BaseModel):
     title: str
     contact_number: str
     department: Optional["DepartmentOut"] = None
+    is_team_head: bool = False
 
     # Roster fields
     organisation: str = ""
@@ -111,6 +112,7 @@ class EmployeeCreate(BaseModel):
     title: str = ""
     contact_number: str = ""
     role: str = "employee"  # "employee" | "hr"
+    is_team_head: bool = False
     organisation: str = ""
     reporting_manager: str = ""
     date_of_joining: Optional[date] = None
@@ -128,6 +130,7 @@ class EmployeeUpdate(BaseModel):
     reporting_manager: Optional[str] = None
     date_of_joining: Optional[date] = None
     is_active: Optional[bool] = None
+    is_team_head: Optional[bool] = None
     password: Optional[str] = None  # set only if HR wants to reset
 
 

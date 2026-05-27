@@ -107,6 +107,12 @@ class User(Base):
         nullable=True,
         index=True,
     )
+    # When True, this user can submit/edit daily reports on behalf of any
+    # employee in the SAME department.  Lets a team lead (e.g. Justina in
+    # Sales) file reports for colleagues without giving them full HR powers.
+    is_team_head = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
 
     # ------ Imported from the HR roster spreadsheet ------
     organisation = Column(String(64), nullable=False, default="", server_default="")

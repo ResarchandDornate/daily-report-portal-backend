@@ -60,17 +60,27 @@ def upsert_report(
     """
     target_user_id = user.id
     if payload.user_id is not None and payload.user_id != user.id:
-        if user.role != "hr":
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Only HR can submit on behalf of other employees",
-            )
-        # Confirm the target user actually exists so we don't create an orphan FK.
+        # Confirm the target exists before we evaluate permission — it's the
+        # same 404 either way.
         target = db.query(User).filter(User.id == payload.user_id).first()
         if not target:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 f"No user with id={payload.user_id}",
+            )
+        # Who can submit on behalf of whom:
+        #   - HR can submit for anyone.
+        #   - A "team head" can submit for any colleague in the SAME department.
+        #   - Everyone else: forbidden.
+        same_dept = (
+            user.department_id is not None
+            and user.department_id == target.department_id
+        )
+        is_team_head = bool(getattr(user, "is_team_head", False))
+        if user.role != "hr" and not (is_team_head and same_dept):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "You don't have permission to submit reports for this employee.",
             )
         target_user_id = target.id
 
