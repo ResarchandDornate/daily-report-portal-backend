@@ -41,14 +41,17 @@ from schemas import SalesUploadOut
 
 router = APIRouter(prefix="/api/sales-uploads", tags=["sales-uploads"])
 
-INSIDE_SALES_SLUG = "insideSales"
+# Slugs whose employees are allowed to upload calling/billing sheets.
+# Inside Sales does outbound call logs; Sales Service (Manisha's team) handles
+# customer follow-ups + DPRs and benefits from the same upload+preview UX.
+UPLOAD_DEPT_SLUGS = {"insideSales", "salesService"}
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB cap — calling sheets are tiny CSV-ish files
 ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 
 
-def _is_inside_sales(user: User) -> bool:
+def _can_upload_sales(user: User) -> bool:
     dept = getattr(user, "department", None)
-    return dept is not None and dept.slug == INSIDE_SALES_SLUG
+    return dept is not None and dept.slug in UPLOAD_DEPT_SLUGS
 
 
 def _is_hr(user: User) -> bool:
@@ -200,10 +203,10 @@ async def create_upload(
     user: User = Depends(get_current_user),
 ):
     # ----- Authorization -----
-    if not (_is_inside_sales(user) or _is_hr(user)):
+    if not (_can_upload_sales(user) or _is_hr(user)):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Only Inside Sales employees (or HR) can upload sales sheets.",
+            "Only Inside Sales / Sales Service employees (or HR) can upload sales sheets.",
         )
 
     # ----- File validation -----
@@ -285,7 +288,7 @@ def list_uploads(
     """List uploads.  HR sees everything; an Inside Sales employee sees own only."""
     q = db.query(SalesUpload).order_by(SalesUpload.uploaded_at.desc())
     if not _is_hr(user):
-        if not _is_inside_sales(user):
+        if not _can_upload_sales(user):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed.")
         q = q.filter(SalesUpload.user_id == user.id)
     return [_to_out(u) for u in q.all()]
