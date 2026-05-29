@@ -131,7 +131,11 @@ def export_xlsx(
 
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill("solid", fgColor="EA580C")  # orange-600
-    header_align = Alignment(horizontal="left", vertical="center")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    # Data cells wrap long text and pin to the top — keeps columns at a sane
+    # width and grows the row height instead of stretching off the screen.
+    body_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    date_align = Alignment(horizontal="left", vertical="top")
 
     sorted_groups = sorted(
         by_dept.values(),
@@ -144,7 +148,7 @@ def export_xlsx(
         ws = wb.create_sheet(title=_unique_sheet_name(wb, title))
 
         fields = group["fields"]
-        headers = ["Date", "Employee", "Title", "Email"] + [
+        headers = ["Date", "Employee"] + [
             (f.get("label") or f.get("key") or "") for f in fields
         ]
         ws.append(headers)
@@ -153,6 +157,7 @@ def export_xlsx(
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = header_align
+        ws.row_dimensions[1].height = 28
 
         # Inside each sheet, sort by date asc then employee — easier to scan.
         reports_sorted = sorted(
@@ -172,17 +177,22 @@ def export_xlsx(
                     f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
                     or u.username
                 )
-            row = [
+            row_vals = [
                 r.date.isoformat() if r.date else "",
                 full_name,
-                (u.title or "") if u else "",
-                (u.email or "") if u else "",
             ]
             for f in fields:
-                row.append(data.get(f.get("key", ""), ""))
-            ws.append(row)
+                row_vals.append(data.get(f.get("key", ""), ""))
+            ws.append(row_vals)
 
-        widths = [12, 28, 22, 32] + [22] * len(fields)
+            row_idx = ws.max_row
+            for col_idx in range(1, len(row_vals) + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.alignment = date_align if col_idx == 1 else body_align
+
+        # Fixed column widths — wide enough to read, narrow enough to fit several
+        # on screen.  Wrap_text handles the rest by growing row heights.
+        widths = [12, 24] + [38] * len(fields)
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "A2"
