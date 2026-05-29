@@ -40,6 +40,48 @@ def _unique_sheet_name(wb: Workbook, base: str) -> str:
         n += 1
 
 
+def _summarise_field(values_with_dates):
+    """Combine multiple per-day cells into ONE summary cell.
+
+    `values_with_dates` is a list of `(date, raw_value)` tuples for the same
+    employee + field across the date range.
+
+    Heuristic:
+      - Drop empty values and leave markers.
+      - If every remaining value parses as a number (allowing ₹, commas,
+        whitespace), return the numeric sum — int if it lands on a whole
+        number, otherwise rounded to 2 dp.
+      - Otherwise, concatenate `date: value` lines so HR can still see what
+        was filled when.
+    """
+    pairs: list[tuple] = []
+    for d, v in values_with_dates:
+        s = ("" if v is None else str(v)).strip()
+        if not s or s.lower() == "on leave":
+            continue
+        pairs.append((d, s))
+    if not pairs:
+        return ""
+
+    nums: list[float] = []
+    is_numeric = True
+    for _, s in pairs:
+        cleaned = s.replace("₹", "").replace("$", "").replace(",", "").replace(" ", "")
+        try:
+            nums.append(float(cleaned))
+        except ValueError:
+            is_numeric = False
+            break
+
+    if is_numeric:
+        total = sum(nums)
+        return int(total) if total == int(total) else round(total, 2)
+
+    return "\n".join(
+        f"{(d.isoformat() if d else '-')}: {s}" for d, s in pairs
+    )
+
+
 @router.get("", response_model=ReportListOut)
 def list_reports(
     employee: int | None = Query(None, description="Filter by employee id"),
@@ -148,9 +190,11 @@ def export_xlsx(
         ws = wb.create_sheet(title=_unique_sheet_name(wb, title))
 
         fields = group["fields"]
-        headers = ["Date", "Employee"] + [
-            (f.get("label") or f.get("key") or "") for f in fields
-        ]
+        headers = (
+            ["Date range", "Employee"]
+            + [(f.get("label") or f.get("key") or "") for f in fields]
+            + ["Reports"]
+        )
         ws.append(headers)
         for col_idx in range(1, len(headers) + 1):
             cell = ws.cell(row=1, column=col_idx)
@@ -159,43 +203,58 @@ def export_xlsx(
             cell.alignment = header_align
         ws.row_dimensions[1].height = 28
 
-        # Inside each sheet, sort by date asc then employee — easier to scan.
-        reports_sorted = sorted(
-            group["reports"],
-            key=lambda r: (
-                r.date or date_type.min,
-                (r.user.last_name or "").lower() if r.user else "",
-                (r.user.first_name or "").lower() if r.user else "",
-            ),
-        )
-        for r in reports_sorted:
-            u = r.user
-            data = r.data or {}
+        # Bucket all reports by employee so we can emit one summary row per
+        # person rather than one row per (person, date).
+        by_user: dict[int, list] = {}
+        for r in group["reports"]:
+            by_user.setdefault(r.user_id, []).append(r)
+
+        def _user_sort_key(uid):
+            u = next((r.user for r in group["reports"] if r.user_id == uid), None)
+            if not u:
+                return ("", "")
+            return ((u.last_name or "").lower(), (u.first_name or "").lower())
+
+        for uid in sorted(by_user.keys(), key=_user_sort_key):
+            user_reports = sorted(
+                by_user[uid], key=lambda r: r.date or date_type.min
+            )
+            u = user_reports[0].user
             full_name = ""
             if u:
                 full_name = (
                     f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
                     or u.username
                 )
-            row_vals = [
-                r.date.isoformat() if r.date else "",
-                full_name,
-            ]
+
+            dates = [r.date for r in user_reports if r.date]
+            if not dates:
+                date_range = ""
+            elif min(dates) == max(dates):
+                date_range = min(dates).isoformat()
+            else:
+                date_range = f"{min(dates).isoformat()} → {max(dates).isoformat()}"
+
+            row_vals = [date_range, full_name]
             for f in fields:
-                row_vals.append(data.get(f.get("key", ""), ""))
+                key = f.get("key", "")
+                pairs = [((r.date), (r.data or {}).get(key, "")) for r in user_reports]
+                row_vals.append(_summarise_field(pairs))
+            row_vals.append(len(user_reports))
             ws.append(row_vals)
 
             row_idx = ws.max_row
             for col_idx in range(1, len(row_vals) + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
-                cell.alignment = date_align if col_idx == 1 else body_align
+                cell.alignment = date_align if col_idx in (1, len(row_vals)) else body_align
 
-        # Fixed column widths — wide enough to read, narrow enough to fit several
-        # on screen.  Wrap_text handles the rest by growing row heights.
-        widths = [12, 24] + [38] * len(fields)
+        # Date range needs more room ("YYYY-MM-DD → YYYY-MM-DD"); per-field
+        # cells are wider so summed/concatenated values aren't cramped; the
+        # tail Reports column is tiny.
+        widths = [24, 24] + [34] * len(fields) + [10]
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(i)].width = w
-        ws.freeze_panes = "A2"
+        ws.freeze_panes = "C2"
 
     if not wb.sheetnames:
         ws = wb.create_sheet(title="No reports")
