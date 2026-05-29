@@ -42,6 +42,10 @@ class UserOut(BaseModel):
     contact_number: str
     department: Optional["DepartmentOut"] = None
     is_team_head: bool = False
+    # The department slug this team head manages, if it overrides their own.
+    # Null when the team head manages their own department (default behavior)
+    # or when is_team_head is False.
+    team_head_dept: Optional[str] = None
 
     # Roster fields
     organisation: str = ""
@@ -131,6 +135,9 @@ class EmployeeUpdate(BaseModel):
     date_of_joining: Optional[date] = None
     is_active: Optional[bool] = None
     is_team_head: Optional[bool] = None
+    # Slug of the department this team head manages (overrides their own dept).
+    # Empty string clears the override.  Ignored if is_team_head is false.
+    team_head_dept: Optional[str] = None
     password: Optional[str] = None  # set only if HR wants to reset
 
 
