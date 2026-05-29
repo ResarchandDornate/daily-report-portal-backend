@@ -58,7 +58,14 @@ class Department(Base):
         onupdate=func.now(),
     )
 
-    employees = relationship("User", back_populates="department")
+    # Disambiguate: User has TWO FKs to this table (department_id for the
+    # user's own dept, team_head_dept_id for the dept they manage).  This
+    # relationship is the membership one — employees IN this department.
+    employees = relationship(
+        "User",
+        back_populates="department",
+        foreign_keys="User.department_id",
+    )
 
     def __repr__(self) -> str:
         return f"<Department slug={self.slug!r} name={self.name!r}>"
@@ -113,6 +120,22 @@ class User(Base):
     is_team_head = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    # Optional override: when set, this team head manages employees in a
+    # DIFFERENT department than their own.  Used when an employee sits in
+    # a "Sales Head" / "Operations Head" department but is responsible for
+    # filing reports for the underlying Sales / Operations team members.
+    # When NULL, the team head manages their own department (default).
+    team_head_dept_id = Column(
+        BigInteger,
+        ForeignKey("departments_department.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    @property
+    def team_head_dept(self):
+        """Convenience accessor — slug of the managed department or None."""
+        managed = getattr(self, "team_head_department", None)
+        return managed.slug if managed else None
 
     # ------ Imported from the HR roster spreadsheet ------
     organisation = Column(String(64), nullable=False, default="", server_default="")
@@ -121,7 +144,15 @@ class User(Base):
     )
     date_of_joining = Column(Date, nullable=True)
 
-    department = relationship("Department", back_populates="employees")
+    department = relationship(
+        "Department",
+        back_populates="employees",
+        foreign_keys=[department_id],
+    )
+    team_head_department = relationship(
+        "Department",
+        foreign_keys=[team_head_dept_id],
+    )
     daily_reports = relationship(
         "DailyReport", back_populates="user", cascade="all, delete-orphan"
     )

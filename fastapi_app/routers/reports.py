@@ -70,14 +70,19 @@ def upsert_report(
             )
         # Who can submit on behalf of whom:
         #   - HR can submit for anyone.
-        #   - A "team head" can submit for any colleague in the SAME department.
+        #   - A "team head" can submit for any employee in their MANAGED
+        #     department.  Managed dept is `team_head_dept_id` when set,
+        #     otherwise falls back to the team head's own department.
         #   - Everyone else: forbidden.
-        same_dept = (
-            user.department_id is not None
-            and user.department_id == target.department_id
-        )
         is_team_head = bool(getattr(user, "is_team_head", False))
-        if user.role != "hr" and not (is_team_head and same_dept):
+        managed_dept_id = (
+            getattr(user, "team_head_dept_id", None) or user.department_id
+        )
+        target_in_managed = (
+            managed_dept_id is not None
+            and target.department_id == managed_dept_id
+        )
+        if user.role != "hr" and not (is_team_head and target_in_managed):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 "You don't have permission to submit reports for this employee.",

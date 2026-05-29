@@ -140,6 +140,10 @@ def update_employee(
         dept = _resolve_dept(db, data.pop("department"))
         target.department_id = dept.id if dept else None
 
+    if "team_head_dept" in data:
+        managed = _resolve_dept(db, data.pop("team_head_dept"))
+        target.team_head_dept_id = managed.id if managed else None
+
     if "password" in data:
         raw = data.pop("password")
         if raw:
