@@ -1,6 +1,10 @@
+import io
 from datetime import date as date_type, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
@@ -10,6 +14,30 @@ from models import DailyReport, Department, User
 from schemas import LeaveIn, ReportIn, ReportListOut, ReportOut
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
+
+# Excel sheet-name rules: max 31 chars, no  : \ / ? * [ ]
+_INVALID_SHEET_CHARS = set(r":\/?*[]")
+
+
+def _sanitize_sheet_name(name: str) -> str:
+    cleaned = "".join("_" if c in _INVALID_SHEET_CHARS else c for c in (name or "Sheet"))
+    cleaned = cleaned.strip() or "Sheet"
+    return cleaned[:31]
+
+
+def _unique_sheet_name(wb: Workbook, base: str) -> str:
+    name = _sanitize_sheet_name(base)
+    existing = set(wb.sheetnames)
+    if name not in existing:
+        return name
+    # Append (2), (3), ... while keeping total <= 31 chars.
+    n = 2
+    while True:
+        suffix = f" ({n})"
+        candidate = name[: 31 - len(suffix)] + suffix
+        if candidate not in existing:
+            return candidate
+        n += 1
 
 
 @router.get("", response_model=ReportListOut)
@@ -44,6 +72,170 @@ def list_reports(
         .all()
     )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/export.xlsx")
+def export_xlsx(
+    employee: int | None = Query(None, description="Filter by employee id"),
+    department: str | None = Query(None, description="Filter by department slug"),
+    start: date_type | None = Query(None, description="Inclusive start date"),
+    end: date_type | None = Query(None, description="Inclusive end date"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Multi-sheet Excel export — one sheet per department.
+
+    The same filters as `list_reports` apply, but pagination is replaced with
+    a hard cap (50k rows) so HR can pull a full window in one click.  Each
+    department gets its own sheet whose columns are Date / Employee / Title
+    / Email + the department's own `report_fields`.  Leave days are written
+    as-is (every field reads "On Leave"), matching what the UI shows.
+    """
+    q = db.query(DailyReport).join(User, DailyReport.user_id == User.id)
+    if employee is not None:
+        q = q.filter(DailyReport.user_id == employee)
+    if department:
+        dept = db.query(Department).filter(Department.slug == department).first()
+        if not dept:
+            return _empty_xlsx("daily-reports.xlsx")
+        q = q.filter(User.department_id == dept.id)
+    if start:
+        q = q.filter(DailyReport.date >= start)
+    if end:
+        q = q.filter(DailyReport.date <= end)
+
+    rows = (
+        q.order_by(DailyReport.date.desc(), DailyReport.user_id)
+        .limit(50000)
+        .all()
+    )
+
+    # Group by department.  Reports for users with no department fall under
+    # a synthetic "No Department" sheet so they aren't silently dropped.
+    by_dept: dict[int | None, dict] = {}
+    for r in rows:
+        u = r.user
+        d = u.department if u else None
+        key = d.id if d else None
+        if key not in by_dept:
+            by_dept[key] = {
+                "dept": d,
+                "fields": list(d.report_fields) if d and d.report_fields else [],
+                "reports": [],
+            }
+        by_dept[key]["reports"].append(r)
+
+    wb = Workbook()
+    # Drop the default empty sheet; we'll re-add a placeholder if there's nothing.
+    wb.remove(wb.active)
+
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", fgColor="EA580C")  # orange-600
+    header_align = Alignment(horizontal="left", vertical="center")
+
+    sorted_groups = sorted(
+        by_dept.values(),
+        key=lambda g: ((g["dept"].name if g["dept"] else "No Department")).lower(),
+    )
+
+    for group in sorted_groups:
+        d = group["dept"]
+        title = d.name if d else "No Department"
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, title))
+
+        fields = group["fields"]
+        headers = ["Date", "Employee", "Title", "Email"] + [
+            (f.get("label") or f.get("key") or "") for f in fields
+        ]
+        ws.append(headers)
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_align
+
+        # Inside each sheet, sort by date asc then employee — easier to scan.
+        reports_sorted = sorted(
+            group["reports"],
+            key=lambda r: (
+                r.date or date_type.min,
+                (r.user.last_name or "").lower() if r.user else "",
+                (r.user.first_name or "").lower() if r.user else "",
+            ),
+        )
+        for r in reports_sorted:
+            u = r.user
+            data = r.data or {}
+            full_name = ""
+            if u:
+                full_name = (
+                    f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                    or u.username
+                )
+            row = [
+                r.date.isoformat() if r.date else "",
+                full_name,
+                (u.title or "") if u else "",
+                (u.email or "") if u else "",
+            ]
+            for f in fields:
+                row.append(data.get(f.get("key", ""), ""))
+            ws.append(row)
+
+        widths = [12, 28, 22, 32] + [22] * len(fields)
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A2"
+
+    if not wb.sheetnames:
+        ws = wb.create_sheet(title="No reports")
+        ws["A1"] = "No reports match the current filters."
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    payload = buf.getvalue()
+
+    # Filename — include the date range when supplied so HR can keep multiple
+    # exports side-by-side without overwriting.
+    parts = ["daily-reports"]
+    if start:
+        parts.append(start.isoformat())
+    if end:
+        parts.append(end.isoformat())
+    if not (start or end):
+        parts.append(date_type.today().isoformat())
+    filename = "_".join(parts) + ".xlsx"
+
+    return Response(
+        content=payload,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
+
+
+def _empty_xlsx(filename: str) -> Response:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "No reports"
+    ws["A1"] = "No reports match the current filters."
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+    return Response(
+        content=data,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(data)),
+        },
+    )
 
 
 @router.post("", response_model=ReportOut, status_code=status.HTTP_201_CREATED)
