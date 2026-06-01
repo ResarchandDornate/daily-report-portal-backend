@@ -317,12 +317,17 @@ def _summarise_user_reports(reports):
 
     meetings_total = None
     revenue_total = None
-    activity_chunks: list[str] = []
+    # Pool every non-empty text value from every text/non-counter field into
+    # one big buffer, then run a single `_condense_summary` pass over it.
+    # Result: Key Activities reads as ONE unified summary of what the
+    # employee actually did — no "Field Name: …" prefixes.  Meeting and
+    # revenue columns are still routed into their own numeric buckets
+    # (Meetings / Revenue) so they don't show up twice.
+    pooled_text_parts: list[str] = []
 
     for f in fields:
         label = (f.get("label") or f.get("key") or "").strip()
         key = f.get("key") or ""
-        # Collect non-empty values for this field (skip blanks + leave markers).
         non_empty = []
         for r in reports:
             v = (r.data or {}).get(key, "")
@@ -333,8 +338,6 @@ def _summarise_user_reports(reports):
         if not non_empty:
             continue
 
-        # Route meeting-like / revenue-like columns into their own buckets so
-        # the rest of the fields can stay in the narrative "Key Activities".
         if _MEETING_LABEL_RE.search(label) and meetings_total is None:
             total = sum(n for _, v in non_empty for n in _extract_numbers_text(v))
             meetings_total = total if total > 0 else None
@@ -344,27 +347,16 @@ def _summarise_user_reports(reports):
             revenue_total = total if total > 0 else None
             continue
 
-        # Otherwise, fold this field into the narrative summary.  Use distinct
-        # case-insensitive values so repeating "Delhi, Delhi, Delhi" collapses,
-        # cap at 12 entries so the cell doesn't explode.
-        seen = set()
-        distinct = []
+        # Pure-numeric counter fields contribute their numbers to the pool as
+        # a short phrase, but don't bloat the narrative with raw digits.
+        # Text/narrative fields are added verbatim.  `_condense_summary`
+        # below dedupes near-duplicates by keyword overlap so we can safely
+        # dump everything in here.
         for _, v in non_empty:
-            key_lower = v.lower()
-            if key_lower in seen:
-                continue
-            seen.add(key_lower)
-            distinct.append(v)
-        # Compact summary — extract the *first phrase* of each distinct
-        # value (text before the first ".", ";", or "(") and pack as many
-        # as fit in ~120 chars per field.  Trailing "…" if truncated.
-        joined = _compact_join(distinct, max_chars=120)
-        activity_chunks.append(f"{label}: {joined}")
+            pooled_text_parts.append(v)
 
-    # Cell-level cap — keep the whole cell to 200 chars (about 2-3 lines).
-    key_activities = "\n".join(activity_chunks) if activity_chunks else ""
-    if len(key_activities) > 200:
-        key_activities = key_activities[:199].rstrip() + "…"
+    big_block = "\n".join(pooled_text_parts)
+    key_activities = _condense_summary(big_block, max_chars=220)
     return full_name, role, key_activities, meetings_total, revenue_total, len(reports)
 
 
@@ -837,11 +829,11 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
     user_rows.sort(key=lambda r: r["name"].lower())
 
     # Matches the on-screen "Inside Sales — summary table" look: clean data
-    # rows (no green tint on money), right-aligned numbers, navy bold totals.
+    # rows (no green tint on money), CENTER-aligned numbers, navy bold totals.
     num_font = Font(size=10, color="1A1A1A")
     money_data_font = Font(size=10, color="1A1A1A")
     total_navy_font = Font(bold=True, size=10, color="1B5E8B")
-    right_align = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    num_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
     row_idx = 5
@@ -850,9 +842,9 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
         for i, f in enumerate(fields):
             v, kind = row["cells"].get(f.get("key", ""), (_DASH, "muted"))
             if kind == "money":
-                _put(ws, row_idx, 3 + i, v, font=money_data_font, fill=_ROW_FILL, align=right_align)
+                _put(ws, row_idx, 3 + i, v, font=money_data_font, fill=_ROW_FILL, align=num_align)
             elif kind == "num":
-                _put(ws, row_idx, 3 + i, v, font=num_font, fill=_ROW_FILL, align=right_align)
+                _put(ws, row_idx, 3 + i, v, font=num_font, fill=_ROW_FILL, align=num_align)
             elif kind == "body":
                 _put(ws, row_idx, 3 + i, v, font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
             else:
@@ -872,12 +864,12 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                     for n in _extract_numbers_text(str(v).replace("₹", "").replace(",", ""))
                 )
                 _put(ws, row_idx, 3 + i, _format_revenue(total) if total else "₹0",
-                     font=total_navy_font, fill=_TOTAL_FILL, align=right_align)
+                     font=total_navy_font, fill=_TOTAL_FILL, align=num_align)
             elif "num" in kinds and "body" not in kinds:
                 total = sum(v for v, k in cells if k == "num" and isinstance(v, (int, float)))
                 disp = int(total) if float(total).is_integer() else round(total, 2)
                 _put(ws, row_idx, 3 + i, disp,
-                     font=total_navy_font, fill=_TOTAL_FILL, align=right_align)
+                     font=total_navy_font, fill=_TOTAL_FILL, align=num_align)
             elif "body" in kinds:
                 all_vals = set()
                 for v, k in cells:
@@ -928,7 +920,7 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
     ws.row_dimensions[4].height = 28
 
     num_font = Font(size=10, color="1A1A1A")
-    right_align = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
     # Aggregation rules:
@@ -1019,7 +1011,7 @@ def _build_project_detail_sheet(ws, group, *, range_label: str):
     ws.row_dimensions[4].height = 28
 
     num_font = Font(size=10, color="1A1A1A")
-    right_align = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
     WORK_KEYS = ("workDone", "workInProgress")
