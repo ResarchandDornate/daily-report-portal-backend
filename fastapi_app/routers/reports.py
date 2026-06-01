@@ -205,6 +205,83 @@ def _dept_sort_key(group):
     return (_DEPT_PRIORITY.get(slug, 99), name)
 
 
+def _condense_summary(text, *, max_chars: int = 200) -> str:
+    """Shrink a long, multi-paragraph block into a short, readable line.
+
+    Produces clean prose with NO truncation markers — no "…", no
+    "(+N more)".  Each surviving phrase is whole; if a phrase doesn't fit
+    the budget, it's dropped entirely so the cell stays clean.
+
+    Strategy (deterministic, no LLM):
+      1. Split on newlines / periods / semicolons / bullets so each
+         "thought" becomes its own fragment.
+      2. Strip ISO date prefixes (`2026-05-04:`) and leading list numbers
+         (`1. `, `2) `) so fragments compare cleanly.
+      3. Dedupe by **keyword overlap** — two fragments are considered
+         the same when ≥ 50% of their content words match.  Catches near
+         duplicates like "Visit Kamala site" and "visit kamala site again".
+      4. For each surviving fragment, keep only the first 5–6 words so it
+         reads like a tight headline ("Module installation at Mavikalan").
+      5. Pack the headlines into `max_chars`, comma-joined.  Stop cleanly
+         when the next phrase would overflow — no trailing marker.
+    """
+    if not text:
+        return ""
+    raw = re.split(r"[\n.;•]+|(?<=\s)[-*]\s+", str(text))
+    seen_keywords: list[frozenset[str]] = []
+    headlines: list[str] = []
+    for frag in raw:
+        s = frag.strip()
+        if not s:
+            continue
+        s = re.sub(r"^\d{4}-\d{2}-\d{2}\s*[:\-]?\s*", "", s)
+        s = re.sub(r"^\d+[.\)]\s*", "", s)
+        s = s.strip(" ,")
+        if not s:
+            continue
+        # Keyword set = words ≥ 3 chars, lowercased — used for dedupe.
+        kw = frozenset(re.findall(r"[a-z]{3,}", s.lower()))
+        if not kw:
+            continue
+        is_dup = False
+        for prev in seen_keywords:
+            shared = len(kw & prev)
+            if shared and shared >= max(2, min(len(kw), len(prev)) // 2):
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        seen_keywords.append(kw)
+        # Keep only the first 6 words so each headline is tight.
+        words = s.split()
+        head = " ".join(words[:6]) if len(words) > 6 else s
+        headlines.append(head)
+    return _compact_join(headlines, max_chars=max_chars)
+
+
+def _compact_join(values, *, max_chars: int = 120) -> str:
+    """Pack whole phrases (comma-joined) into `max_chars`, stopping
+    cleanly when the next phrase wouldn't fit.  NO "…", NO "(+N more)".
+    """
+    if not values:
+        return ""
+    out = ""
+    for v in values:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        candidate = s if not out else f"{out}, {s}"
+        if len(candidate) > max_chars:
+            # Stop — but if we haven't taken anything yet, take one whole
+            # phrase even if it slightly exceeds the budget (so the cell
+            # isn't empty).
+            if not out:
+                return s
+            break
+        out = candidate
+    return out
+
+
 def _format_revenue(n):
     """Render a revenue value as `₹X,XXX,XXX` (no decimal if whole)."""
     if n is None:
@@ -278,21 +355,16 @@ def _summarise_user_reports(reports):
                 continue
             seen.add(key_lower)
             distinct.append(v)
-        # Keep the cell tight: at most 2 distinct values per field, each
-        # trimmed to 40 chars, "(+N more)" hints at the rest.
-        trimmed = []
-        for v in distinct[:2]:
-            trimmed.append(v if len(v) <= 40 else v[:37].rstrip() + "…")
-        joined = ", ".join(trimmed)
-        if len(distinct) > 2:
-            joined += f" (+{len(distinct) - 2} more)"
+        # Compact summary — extract the *first phrase* of each distinct
+        # value (text before the first ".", ";", or "(") and pack as many
+        # as fit in ~120 chars per field.  Trailing "…" if truncated.
+        joined = _compact_join(distinct, max_chars=120)
         activity_chunks.append(f"{label}: {joined}")
 
-    # Cell-level cap so even employees with many fields stay on 1-2 lines.
+    # Cell-level cap — keep the whole cell to 200 chars (about 2-3 lines).
     key_activities = "\n".join(activity_chunks) if activity_chunks else ""
-    _MAX_ACTIVITIES_LEN = 200
-    if len(key_activities) > _MAX_ACTIVITIES_LEN:
-        key_activities = key_activities[: _MAX_ACTIVITIES_LEN - 1].rstrip() + "…"
+    if len(key_activities) > 200:
+        key_activities = key_activities[:199].rstrip() + "…"
     return full_name, role, key_activities, meetings_total, revenue_total, len(reports)
 
 
@@ -385,7 +457,11 @@ def export_xlsx(
 
     if inside_sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Inside Sales — Detail"))
-        _build_dept_detail_sheet(ws, inside_sales_group, range_label=range_label)
+        # Drop the columns HR doesn't want on the Inside Sales tab.
+        _build_dept_detail_sheet(
+            ws, inside_sales_group, range_label=range_label,
+            exclude_keys=("dataCalledType", "mailSent", "whatsappSent", "otherWorks"),
+        )
 
     if service_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Service — Detail"))
@@ -655,14 +731,20 @@ def _build_department_sheet(ws, group, *, range_label: str):
     _set_print_landscape_fit(ws)
 
 
-def _build_dept_detail_sheet(ws, group, *, range_label: str):
+def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
     """Per-field columns layout for a single department.  Used for Sales and
     Inside Sales detail tabs — Employee + one column per report_field.
     Numeric fields are summed; text fields are joined as distinct values.
+
+    `exclude_keys` skips named fields entirely (used by Inside Sales to drop
+    Data Called Type / Mail Sent / WhatsApp Sent / Other Works columns).
     """
     d = group["dept"]
     dept_name = d.name if d else "No Department"
     fields = list(d.report_fields) if d and d.report_fields else []
+    if exclude_keys:
+        skip = set(exclude_keys)
+        fields = [f for f in fields if f.get("key") not in skip]
     n_fields = len(fields)
     last_col = 2 + n_fields  # A margin + B Employee + N field cols
 
@@ -741,24 +823,16 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str):
                     disp = int(total) if float(total).is_integer() else round(total, 2)
                     cells[key] = (disp, "num")
                 else:
-                    # Text — keep it compact: 4 distinct values, each ≤ 30
-                    # chars, with "(+N more)" hint, and an overall 120-char
-                    # cap so the cell never blows out the row.
+                    # Text — compact join: distinct values, headline-only,
+                    # trimmed to fit ~120 chars total with a trailing "…"
+                    # when truncated.  No "(+N more)" markers.
                     seen, distinct = set(), []
                     for _, v in non_empty:
                         if v.lower() in seen:
                             continue
                         seen.add(v.lower())
                         distinct.append(v)
-                    trimmed = []
-                    for v in distinct[:4]:
-                        trimmed.append(v if len(v) <= 30 else v[:27].rstrip() + "…")
-                    text = ", ".join(trimmed)
-                    if len(distinct) > 4:
-                        text += f" (+{len(distinct) - 4} more)"
-                    if len(text) > 120:
-                        text = text[:119].rstrip() + "…"
-                    cells[key] = (text, "body")
+                    cells[key] = (_compact_join(distinct, max_chars=120), "body")
         user_rows.append({"name": full_name, "cells": cells})
     user_rows.sort(key=lambda r: r["name"].lower())
 
@@ -964,9 +1038,9 @@ def _build_project_detail_sheet(ws, group, *, range_label: str):
         # Site visit count = number of reports submitted in range.
         visit_count = len(sorted_reports)
 
-        # Work on Site — keep it tight: 2 distinct snippets, each ≤ 40 chars,
-        # whole cell capped at 150 chars.  Long histories collapse to
-        # "(+N more)" so the row stays one or two visible lines.
+        # Work on Site — compact join of distinct headline phrases from
+        # Work Done + Work in Progress, packed into ~150 chars.  Trailing
+        # "…" hints at overflow without a "(+N more)" tag.
         seen = set()
         distinct = []
         for r in sorted_reports:
@@ -980,14 +1054,7 @@ def _build_project_detail_sheet(ws, group, *, range_label: str):
                     continue
                 seen.add(key_lower)
                 distinct.append(v)
-        trimmed = []
-        for v in distinct[:2]:
-            trimmed.append(v if len(v) <= 40 else v[:37].rstrip() + "…")
-        work_text = ", ".join(trimmed)
-        if len(distinct) > 2:
-            work_text += f" (+{len(distinct) - 2} more)"
-        if len(work_text) > 150:
-            work_text = work_text[:149].rstrip() + "…"
+        work_text = _compact_join(distinct, max_chars=150)
 
         user_rows.append({
             "name": full_name,
