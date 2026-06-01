@@ -5,7 +5,7 @@ from datetime import date as date_type, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.page import PageMargins
 from sqlalchemy import and_
@@ -145,6 +145,14 @@ _TOTAL_FONT = Font(bold=True, size=10, color="1B5E8B")          # navy bold tota
 _TOTAL_FILL = PatternFill("solid", fgColor="EAF1F8")            # subtle blue total bar
 _LEFT_TOP_WRAP = Alignment(horizontal="left", vertical="top", wrap_text=True)
 _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+# Thin light-grey border for table cells — gives the layout clear gridlines
+# so HR can read rows/columns at a glance.
+_CELL_BORDER = Border(
+    left=Side(style="thin", color="C9D2DC"),
+    right=Side(style="thin", color="C9D2DC"),
+    top=Side(style="thin", color="C9D2DC"),
+    bottom=Side(style="thin", color="C9D2DC"),
+)
 
 
 # Field-label classifiers: which column to treat as "Meetings" and which as
@@ -530,6 +538,16 @@ def _merge_title(ws, row, last_col, value, font):
     ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=last_col)
 
 
+def _apply_table_borders(ws, *, header_row: int, last_row: int, first_col: int, last_col: int):
+    """Paint a thin light-grey border on every cell in the data table region
+    (header row + data rows) so the layout reads like a clean table."""
+    if last_row < header_row:
+        return
+    for r in range(header_row, last_row + 1):
+        for c in range(first_col, last_col + 1):
+            ws.cell(row=r, column=c).border = _CELL_BORDER
+
+
 def _set_print_landscape_fit(ws):
     """Configure the sheet so Excel's print/PDF lands on a single landscape
     page wide and lets rows flow to as many pages as needed."""
@@ -885,6 +903,11 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                 _put(ws, row_idx, 3 + i, _DASH,
                      font=_MUTED_FONT, fill=_TOTAL_FILL, align=_CENTER)
 
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -924,12 +947,24 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
     # Aggregation rules:
-    #   Total Site Visit         = Solar Install visits + Inverter Complaint visits
-    #   Total Inverter Complaint = Complaint site visits + Complaint tele/video
-    #   Inverter Parts Replace   = Inverter Part Replacement
+    # Each cell shows the COUNT OF DAYS the employee logged meaningful
+    # content in that area (a day with "N/A" / "Na" / "-" does NOT count).
+    #
+    #   Total Site Visit         = days where Solar Install OR Inverter
+    #                              Complaint site visit field has real content
+    #   Total Inverter Complaint = days where Complaint site visit OR
+    #                              Complaint tele/video field has real content
+    #   Inverter Parts Replace   = days where Inverter Part Replacement has
+    #                              real content
     SITE_VISIT_KEYS = ("solarInstallationSiteVisit", "inverterComplaintSiteVisit")
     INV_COMPLAINT_KEYS = ("inverterComplaintSiteVisit", "inverterComplaintTeleVideo")
     PARTS_REPL_KEYS = ("inverterPartReplacement",)
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
 
     user_rows = []
     for _, user_reports in group["users"].items():
@@ -942,20 +977,21 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
                 or u.username
             )
 
-        def sum_keys(keys):
-            total = 0.0
+        def count_days(keys):
+            """Return number of reports where ANY of the given fields has
+            meaningful content."""
+            total = 0
             for r in sorted_reports:
                 data = r.data or {}
-                for k in keys:
-                    for n in _extract_numbers_text(data.get(k, "")):
-                        total += n
+                if any(_has_content(data.get(k, "")) for k in keys):
+                    total += 1
             return total
 
         user_rows.append({
             "name": full_name,
-            "site_visit": sum_keys(SITE_VISIT_KEYS),
-            "inv_complaint": sum_keys(INV_COMPLAINT_KEYS),
-            "parts_repl": sum_keys(PARTS_REPL_KEYS),
+            "site_visit": count_days(SITE_VISIT_KEYS),
+            "inv_complaint": count_days(INV_COMPLAINT_KEYS),
+            "parts_repl": count_days(PARTS_REPL_KEYS),
         })
     user_rows.sort(key=lambda r: r["name"].lower())
 
@@ -977,6 +1013,11 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
             _put(ws, row_idx, 3 + i, _disp(total),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1072,6 +1113,11 @@ def _build_project_detail_sheet(ws, group, *, range_label: str):
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
         _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
 
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1143,6 +1189,8 @@ def _build_combined_summary_sheet(ws, other_groups, *, range_label: str, today_l
                  fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
             row_idx += 1
 
+    _apply_table_borders(ws, header_row=4, last_row=row_idx - 1,
+                         first_col=2, last_col=last_col)
     ws.freeze_panes = "D5"
     _set_print_landscape_fit(ws)
 
