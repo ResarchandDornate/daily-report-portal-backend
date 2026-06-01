@@ -1,10 +1,12 @@
 import io
+import re
 from datetime import date as date_type, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.page import PageMargins
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
@@ -142,11 +144,61 @@ _LEFT_TOP_WRAP = Alignment(horizontal="left", vertical="top", wrap_text=True)
 _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
+# Field-label classifiers: which column to treat as "Meetings" and which as
+# "Revenue" in the new compact report layout (mirrors the manual HR report).
+_MEETING_LABEL_RE = re.compile(r"\b(meeting|call|visit|enquir)", re.I)
+_REVENUE_LABEL_RE = re.compile(
+    r"\b(revenue|amount|invoice|sales|rupees|payment|earning|₹)", re.I
+)
+# Number token: handles thousand-separator commas, optional decimals, and
+# detects trailing ordinal suffix so "25th" / "1st" can be skipped.
+_NUMBER_TOKEN_RE = re.compile(
+    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?:\s*(st|nd|rd|th)\b)?",
+    re.I,
+)
+
+
+def _extract_numbers_text(s):
+    """Pull every number out of a free-text cell.  Handles thousand-separator
+    commas, skips year-looking integers (1900-2100), skips ordinal dates
+    ("25th", "1st").  So "Monthly Sales- 1,287.32" → [1287.32], and
+    "4, 2, 25th May 2026, 3" → [4, 2, 3].
+    """
+    if s is None:
+        return []
+    out = []
+    for m in _NUMBER_TOKEN_RE.finditer(str(s)):
+        if m.group(2):
+            continue  # ordinal suffix — skip
+        try:
+            n = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if n.is_integer() and 1900 <= int(n) <= 2100:
+            continue  # year-like — skip
+        out.append(n)
+    return out
+
+
+def _format_revenue(n):
+    """Render a revenue value as `₹X,XXX,XXX` (no decimal if whole)."""
+    if n is None:
+        return _DASH
+    if isinstance(n, float) and not n.is_integer():
+        return f"₹{n:,.2f}"
+    return f"₹{int(n):,}"
+
+
 def _summarise_user_reports(reports):
-    """Build a (full_name, role, date_range, field_values, n_reports) tuple
-    for one employee's set of daily reports.  `field_values` is a dict keyed
-    by report-field key whose value is the per-cell summary (sum if numeric,
-    date-prefixed concatenation otherwise).
+    """Condense one employee's set of daily reports into a single summary row:
+
+      (full_name, role, key_activities, meetings_total, revenue_total, n_reports)
+
+    `key_activities` is a multi-line "Field Label: distinct values…" string
+    that consolidates every text/free-form field for the date range.  Fields
+    whose label looks like a meeting/call counter feed the `meetings_total`
+    bucket; fields that look like revenue feed `revenue_total`.  Both
+    numbers are `None` when no values were filled.
     """
     user = reports[0].user
     full_name = ""
@@ -158,23 +210,56 @@ def _summarise_user_reports(reports):
         )
         role = (user.title or "").strip()
 
-    dates = sorted([r.date for r in reports if r.date])
-    if not dates:
-        date_range = _DASH
-    elif dates[0] == dates[-1]:
-        date_range = dates[0].isoformat()
-    else:
-        date_range = f"{dates[0].isoformat()} → {dates[-1].isoformat()}"
-
     dept = user.department if user else None
     fields = list(dept.report_fields) if dept and dept.report_fields else []
-    field_values: dict[str, object] = {}
-    for f in fields:
-        key = f.get("key") or ""
-        pairs = [(r.date, (r.data or {}).get(key, "")) for r in reports]
-        field_values[key] = _summarise_field(pairs)
 
-    return full_name, role, date_range, field_values, len(reports), fields
+    meetings_total = None
+    revenue_total = None
+    activity_chunks: list[str] = []
+
+    for f in fields:
+        label = (f.get("label") or f.get("key") or "").strip()
+        key = f.get("key") or ""
+        # Collect non-empty values for this field (skip blanks + leave markers).
+        non_empty = []
+        for r in reports:
+            v = (r.data or {}).get(key, "")
+            s = ("" if v is None else str(v)).strip()
+            if not s or s.lower() == "on leave":
+                continue
+            non_empty.append((r.date, s))
+        if not non_empty:
+            continue
+
+        # Route meeting-like / revenue-like columns into their own buckets so
+        # the rest of the fields can stay in the narrative "Key Activities".
+        if _MEETING_LABEL_RE.search(label) and meetings_total is None:
+            total = sum(n for _, v in non_empty for n in _extract_numbers_text(v))
+            meetings_total = total if total > 0 else None
+            continue
+        if _REVENUE_LABEL_RE.search(label) and revenue_total is None:
+            total = sum(n for _, v in non_empty for n in _extract_numbers_text(v))
+            revenue_total = total if total > 0 else None
+            continue
+
+        # Otherwise, fold this field into the narrative summary.  Use distinct
+        # case-insensitive values so repeating "Delhi, Delhi, Delhi" collapses,
+        # cap at 12 entries so the cell doesn't explode.
+        seen = set()
+        distinct = []
+        for _, v in non_empty:
+            key_lower = v.lower()
+            if key_lower in seen:
+                continue
+            seen.add(key_lower)
+            distinct.append(v)
+        joined = ", ".join(distinct[:12])
+        if len(distinct) > 12:
+            joined += f" (+{len(distinct) - 12} more)"
+        activity_chunks.append(f"{label}: {joined}")
+
+    key_activities = "\n".join(activity_chunks) if activity_chunks else ""
+    return full_name, role, key_activities, meetings_total, revenue_total, len(reports)
 
 
 @router.get("/export.xlsx")
@@ -319,6 +404,17 @@ def _merge_title(ws, row, last_col, value, font):
     ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=last_col)
 
 
+def _set_print_landscape_fit(ws):
+    """Configure the sheet so Excel's print/PDF lands on a single landscape
+    page wide and lets rows flow to as many pages as needed."""
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.5, bottom=0.5)
+    ws.print_options.horizontalCentered = True
+
+
 def _build_summary_sheet(
     ws,
     by_dept,
@@ -329,16 +425,24 @@ def _build_summary_sheet(
     total_employees: int,
     dept_count: int,
 ):
-    """Columns: A (margin) | B Employee | C Department | D Role | E Date range | F Reports."""
-    last_col = 6
-    ws.column_dimensions["A"].width = 3
-    ws.column_dimensions["B"].width = 26
-    ws.column_dimensions["C"].width = 22
-    ws.column_dimensions["D"].width = 22
-    ws.column_dimensions["E"].width = 26
-    ws.column_dimensions["F"].width = 11
+    """All-employees summary — 6 columns matching HR's manual report:
 
-    _merge_title(ws, 1, last_col, f"All Department Employee Summary Report — {range_label}", _TITLE_FONT)
+    A (margin) | B Employee Name | C Department | D Role | E Key Activities | F Meetings | G Revenue (₹)
+    """
+    last_col = 7
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 24   # Employee
+    ws.column_dimensions["C"].width = 20   # Department
+    ws.column_dimensions["D"].width = 22   # Role
+    ws.column_dimensions["E"].width = 70   # Key Activities (wide narrative)
+    ws.column_dimensions["F"].width = 12   # Meetings
+    ws.column_dimensions["G"].width = 16   # Revenue
+
+    _merge_title(
+        ws, 1, last_col,
+        f"All Department Employee Summary Report — {range_label}",
+        _TITLE_FONT,
+    )
     ws.row_dimensions[1].height = 30
     subtitle = (
         f"Ornate Solar  |  {total_reports} reports  |  {total_employees} employees  "
@@ -346,12 +450,18 @@ def _build_summary_sheet(
     )
     _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
 
-    headers = ["Employee Name", "Department", "Role / Designation", "Date range", "Reports"]
+    headers = [
+        "Employee Name",
+        "Department",
+        "Role / Designation",
+        f"Key Activities ({range_label})",
+        "Meetings",
+        "Revenue (₹)",
+    ]
     for i, h in enumerate(headers, start=2):
         _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
-    ws.row_dimensions[4].height = 24
+    ws.row_dimensions[4].height = 28
 
-    # Sort: department name, then employee name.
     sorted_groups = sorted(
         by_dept.values(),
         key=lambda g: ((g["dept"].name if g["dept"] else "No Department")).lower(),
@@ -361,45 +471,56 @@ def _build_summary_sheet(
     for group in sorted_groups:
         d = group["dept"]
         dept_name = d.name if d else "No Department"
-        # Sort users within department by name.
         user_entries = []
         for _, user_reports in group["users"].items():
-            user_reports_sorted = sorted(user_reports, key=lambda r: r.date or date_type.min)
-            name, role, date_range, _, count, _ = _summarise_user_reports(user_reports_sorted)
-            user_entries.append((name, role, date_range, count))
+            sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+            user_entries.append(_summarise_user_reports(sorted_reports))
         user_entries.sort(key=lambda t: t[0].lower())
 
-        for idx, (name, role, date_range, count) in enumerate(user_entries):
+        for idx, (name, role, key_acts, meetings, revenue, _count) in enumerate(user_entries):
             _put(ws, row_idx, 2, name, font=_NAME_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
             if idx == 0:
                 _put(ws, row_idx, 3, dept_name, font=_BADGE_FONT, fill=_BADGE_FILL, align=_CENTER)
             else:
                 _put(ws, row_idx, 3, "", fill=_ROW_FILL)
             _put(ws, row_idx, 4, role or _DASH,
-                 font=_BODY_FONT if role else _MUTED_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
-            _put(ws, row_idx, 5, date_range, font=_BODY_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
-            _put(ws, row_idx, 6, count, font=_NAME_FONT, fill=_ROW_FILL, align=_CENTER)
+                 font=_BODY_FONT if role else _MUTED_FONT,
+                 fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+            _put(ws, row_idx, 5, key_acts or _DASH,
+                 font=_BODY_FONT if key_acts else _MUTED_FONT,
+                 fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+            if meetings is not None:
+                disp = int(meetings) if float(meetings).is_integer() else round(meetings, 2)
+                _put(ws, row_idx, 6, disp, font=_NAME_FONT, fill=_ROW_FILL, align=_CENTER)
+            else:
+                _put(ws, row_idx, 6, _DASH, font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
+            if revenue is not None:
+                _put(ws, row_idx, 7, _format_revenue(revenue),
+                     font=Font(bold=True, size=10, color="155F00"),
+                     fill=_ROW_FILL, align=_CENTER)
+            else:
+                _put(ws, row_idx, 7, _DASH, font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
             row_idx += 1
 
     ws.freeze_panes = "B5"
+    _set_print_landscape_fit(ws)
 
 
 def _build_department_sheet(ws, group, *, range_label: str):
-    """Columns: A (margin) | B Employee | C Role | D Date range | <fields…> | <Reports>."""
+    """Per-department sheet — 5 columns matching HR's manual report:
+
+    A (margin) | B Employee | C Role | D Key Activities | E Meetings | F Revenue (₹)
+    """
     d = group["dept"]
     dept_name = d.name if d else "No Department"
-    fields = list(d.report_fields) if d and d.report_fields else []
-    n_fields = len(fields)
-    # Static cols: margin(A) + Employee(B) + Role(C) + Date range(D) + Reports(last)
-    last_col = 4 + n_fields + 1  # +1 for Reports tail
+    last_col = 6
 
     ws.column_dimensions["A"].width = 3
-    ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 22
-    ws.column_dimensions["D"].width = 24
-    for i in range(n_fields):
-        ws.column_dimensions[get_column_letter(5 + i)].width = 30
-    ws.column_dimensions[get_column_letter(last_col)].width = 11
+    ws.column_dimensions["B"].width = 24   # Employee
+    ws.column_dimensions["C"].width = 22   # Role
+    ws.column_dimensions["D"].width = 80   # Key Activities (wide, narrative)
+    ws.column_dimensions["E"].width = 12   # Meetings
+    ws.column_dimensions["F"].width = 16   # Revenue
 
     _merge_title(
         ws, 1, last_col,
@@ -409,28 +530,24 @@ def _build_department_sheet(ws, group, *, range_label: str):
     ws.row_dimensions[1].height = 30
     n_users = len(group["users"])
     n_reports = sum(len(rs) for rs in group["users"].values())
-    subtitle = f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  {n_reports} reports submitted"
+    subtitle = (
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
     _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
 
-    # Header row at row 4 (row 3 left as visual breathing space, like the ref).
-    headers = ["Employee", "Role", "Date range"] + [
-        (f.get("label") or f.get("key") or "") for f in fields
-    ] + ["Reports"]
+    headers = ["Employee", "Role", f"Key Activities ({range_label})", "Meetings", "Revenue (₹)"]
     for i, h in enumerate(headers, start=2):
         _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
-    ws.row_dimensions[4].height = 26
+    ws.row_dimensions[4].height = 28
 
-    # Build employee rows (sorted by name).
     user_rows = []
     for _, user_reports in group["users"].items():
         sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
-        name, role, date_range, field_values, count, _ = _summarise_user_reports(sorted_reports)
+        name, role, key_acts, meetings, revenue, count = _summarise_user_reports(sorted_reports)
         user_rows.append({
-            "name": name,
-            "role": role,
-            "range": date_range,
-            "field_values": field_values,
-            "count": count,
+            "name": name, "role": role, "key_acts": key_acts,
+            "meetings": meetings, "revenue": revenue, "count": count,
         })
     user_rows.sort(key=lambda r: r["name"].lower())
 
@@ -438,45 +555,49 @@ def _build_department_sheet(ws, group, *, range_label: str):
     for row in user_rows:
         _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
         _put(ws, row_idx, 3, row["role"] or _DASH,
-             font=_BODY_FONT if row["role"] else _MUTED_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
-        _put(ws, row_idx, 4, row["range"], font=_BODY_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
-        for fi, f in enumerate(fields):
-            v = row["field_values"].get(f.get("key", ""), "")
-            display = v if v not in ("", None) else _DASH
-            _put(
-                ws, row_idx, 5 + fi, display,
-                font=_BODY_FONT if v not in ("", None) else _MUTED_FONT,
-                fill=_ROW_FILL,
-                align=_LEFT_TOP_WRAP,
-            )
-        _put(ws, row_idx, last_col, row["count"], font=_NAME_FONT, fill=_ROW_FILL, align=_CENTER)
+             font=_BODY_FONT if row["role"] else _MUTED_FONT,
+             fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+        _put(ws, row_idx, 4, row["key_acts"] or _DASH,
+             font=_BODY_FONT if row["key_acts"] else _MUTED_FONT,
+             fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+        if row["meetings"] is not None:
+            disp = int(row["meetings"]) if float(row["meetings"]).is_integer() else round(row["meetings"], 2)
+            _put(ws, row_idx, 5, disp, font=_NAME_FONT, fill=_ROW_FILL, align=_CENTER)
+        else:
+            _put(ws, row_idx, 5, _DASH, font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
+        if row["revenue"] is not None:
+            _put(ws, row_idx, 6, _format_revenue(row["revenue"]),
+                 font=Font(bold=True, size=10, color="155F00"),
+                 fill=_ROW_FILL, align=_CENTER)
+        else:
+            _put(ws, row_idx, 6, _DASH, font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
         row_idx += 1
 
-    # Department total row — sum numeric field columns, em-dash for text/empty.
+    # Department total row.
     if user_rows:
-        _put(ws, row_idx, 2, "Department Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_LEFT_TOP_WRAP)
+        _put(ws, row_idx, 2, "Department Total",
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_LEFT_TOP_WRAP)
         _put(ws, row_idx, 3,
              f"{len(user_rows)} {'employee' if len(user_rows) == 1 else 'employees'}",
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_LEFT_TOP_WRAP)
-        _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
-        for fi, f in enumerate(fields):
-            vals = [r["field_values"].get(f.get("key", ""), "") for r in user_rows]
-            numeric = [v for v in vals if isinstance(v, (int, float))]
-            if numeric and len(numeric) == len(vals):
-                total = sum(numeric)
-                display = int(total) if total == int(total) else round(total, 2)
-            else:
-                display = _DASH
-            _put(
-                ws, row_idx, 5 + fi, display,
-                font=_TOTAL_FONT if isinstance(display, (int, float)) else _MUTED_FONT,
-                fill=_TOTAL_FILL,
-                align=_CENTER if isinstance(display, (int, float)) else _LEFT_TOP_WRAP,
-            )
-        _put(ws, row_idx, last_col, sum(r["count"] for r in user_rows),
-             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_CENTER)
+        _put(ws, row_idx, 4, f"{n_reports} reports submitted",
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_LEFT_TOP_WRAP)
+        meetings_sum = sum(r["meetings"] or 0 for r in user_rows)
+        if any(r["meetings"] is not None for r in user_rows):
+            disp = int(meetings_sum) if float(meetings_sum).is_integer() else round(meetings_sum, 2)
+            _put(ws, row_idx, 5, disp, font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_CENTER)
+        else:
+            _put(ws, row_idx, 5, _DASH, font=_MUTED_FONT, fill=_TOTAL_FILL, align=_CENTER)
+        revenue_sum = sum(r["revenue"] or 0 for r in user_rows)
+        if any(r["revenue"] is not None for r in user_rows):
+            _put(ws, row_idx, 6, _format_revenue(revenue_sum),
+                 font=Font(bold=True, size=10, color="155F00"),
+                 fill=_TOTAL_FILL, align=_CENTER)
+        else:
+            _put(ws, row_idx, 6, _DASH, font=_MUTED_FONT, fill=_TOTAL_FILL, align=_CENTER)
 
     ws.freeze_panes = "B5"
+    _set_print_landscape_fit(ws)
 
 
 def _empty_xlsx(filename: str) -> Response:
