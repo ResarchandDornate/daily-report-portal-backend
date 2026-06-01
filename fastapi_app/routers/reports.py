@@ -1,3 +1,4 @@
+import csv
 import io
 import re
 from datetime import date as date_type, datetime, timedelta, timezone
@@ -180,6 +181,20 @@ def _extract_numbers_text(s):
     return out
 
 
+# Department display order: Sales first, Inside Sales second, then every
+# other department alphabetically.  Applied to both the Summary sheet and
+# the per-department sheet creation order so HR sees the same priority in
+# both surfaces.
+_DEPT_PRIORITY = {"sales": 0, "insideSales": 1}
+
+
+def _dept_sort_key(group):
+    d = group["dept"]
+    slug = getattr(d, "slug", "") if d else ""
+    name = (d.name if d else "No Department").lower()
+    return (_DEPT_PRIORITY.get(slug, 99), name)
+
+
 def _format_revenue(n):
     """Render a revenue value as `₹X,XXX,XXX` (no decimal if whole)."""
     if n is None:
@@ -322,28 +337,38 @@ def export_xlsx(
     total_employees = sum(len(grp["users"]) for grp in by_dept.values())
     dept_count = len([g for g in by_dept.values() if g["dept"] is not None])
 
-    # ----- Summary sheet (all departments combined) -----
-    summary_ws = wb.create_sheet(title=_unique_sheet_name(wb, "Summary"))
-    _build_summary_sheet(
-        summary_ws,
-        by_dept,
-        range_label=range_label,
-        today_label=today_label,
-        total_reports=total_reports,
-        total_employees=total_employees,
-        dept_count=dept_count,
-    )
+    # Three-sheet layout — matches HR's manual Numbers report:
+    #   1. Sales — Detail        (per-field columns, only Sales employees)
+    #   2. Inside Sales — Detail (per-field columns, only Inside Sales)
+    #   3. Detailed Summary      (all OTHER departments, one row per
+    #                             employee with consolidated Key Activities)
+    sales_group = None
+    inside_sales_group = None
+    other_groups = []
+    for group in by_dept.values():
+        slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
+        if slug == "sales":
+            sales_group = group
+        elif slug == "insideSales":
+            inside_sales_group = group
+        else:
+            other_groups.append(group)
 
-    # ----- One sheet per department -----
-    sorted_groups = sorted(
-        by_dept.values(),
-        key=lambda g: ((g["dept"].name if g["dept"] else "No Department")).lower(),
-    )
-    for group in sorted_groups:
-        d = group["dept"]
-        sheet_title = d.name if d else "No Department"
-        ws = wb.create_sheet(title=_unique_sheet_name(wb, sheet_title))
-        _build_department_sheet(ws, group, range_label=range_label)
+    if sales_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales — Detail"))
+        _build_dept_detail_sheet(ws, sales_group, range_label=range_label)
+
+    if inside_sales_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Inside Sales — Detail"))
+        _build_dept_detail_sheet(ws, inside_sales_group, range_label=range_label)
+
+    if other_groups:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
+        _build_combined_summary_sheet(
+            ws, other_groups,
+            range_label=range_label,
+            today_label=today_label,
+        )
 
     if not wb.sheetnames:
         ws = wb.create_sheet(title="No reports")
@@ -462,10 +487,7 @@ def _build_summary_sheet(
         _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
     ws.row_dimensions[4].height = 28
 
-    sorted_groups = sorted(
-        by_dept.values(),
-        key=lambda g: ((g["dept"].name if g["dept"] else "No Department")).lower(),
-    )
+    sorted_groups = sorted(by_dept.values(), key=_dept_sort_key)
 
     row_idx = 5
     for group in sorted_groups:
@@ -600,6 +622,228 @@ def _build_department_sheet(ws, group, *, range_label: str):
     _set_print_landscape_fit(ws)
 
 
+def _build_dept_detail_sheet(ws, group, *, range_label: str):
+    """Per-field columns layout for a single department.  Used for Sales and
+    Inside Sales detail tabs — Employee + one column per report_field.
+    Numeric fields are summed; text fields are joined as distinct values.
+    """
+    d = group["dept"]
+    dept_name = d.name if d else "No Department"
+    fields = list(d.report_fields) if d and d.report_fields else []
+    n_fields = len(fields)
+    last_col = 2 + n_fields  # A margin + B Employee + N field cols
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 22  # Employee
+    for i in range(n_fields):
+        ws.column_dimensions[get_column_letter(3 + i)].width = 22
+
+    _merge_title(
+        ws, 1, last_col,
+        f"{dept_name} — summary table",
+        _TITLE_FONT,
+    )
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    # Header row.
+    _put(ws, 4, 2, "Employee", font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    for i, f in enumerate(fields):
+        label = f.get("label") or f.get("key") or ""
+        _put(ws, 4, 3 + i, label,
+             font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    # Build per-employee rows.
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+        cells = {}
+        for f in fields:
+            key = f.get("key") or ""
+            label = f.get("label") or key
+            pairs = [(r.date, (r.data or {}).get(key, "")) for r in sorted_reports]
+            non_empty = [
+                (d_, str(v).strip()) for d_, v in pairs
+                if v and str(v).strip() and str(v).strip().lower() != "on leave"
+            ]
+            if not non_empty:
+                cells[key] = (_DASH, "muted")
+                continue
+            # Decide numeric vs text by label hint OR strict parse.
+            if _NUMBER_TOKEN_RE.search(label) or _MEETING_LABEL_RE.search(label) or _REVENUE_LABEL_RE.search(label):
+                total = sum(n for _, v in non_empty for n in _extract_numbers_text(v))
+                is_money = bool(_REVENUE_LABEL_RE.search(label))
+                if is_money:
+                    cells[key] = (_format_revenue(total) if total else "₹0", "money" if total else "muted")
+                else:
+                    disp = int(total) if float(total).is_integer() else round(total, 2)
+                    cells[key] = (disp, "num")
+            else:
+                # Strict-parse check.
+                nums, all_num = [], True
+                for _, v in non_empty:
+                    cleaned = v.replace("₹", "").replace("$", "").replace(",", "").replace(" ", "")
+                    try:
+                        nums.append(float(cleaned))
+                    except ValueError:
+                        all_num = False
+                        break
+                if all_num and nums:
+                    total = sum(nums)
+                    disp = int(total) if float(total).is_integer() else round(total, 2)
+                    cells[key] = (disp, "num")
+                else:
+                    # Text — comma-join distinct values.
+                    seen, distinct = set(), []
+                    for _, v in non_empty:
+                        if v.lower() in seen:
+                            continue
+                        seen.add(v.lower())
+                        distinct.append(v)
+                    cells[key] = (", ".join(distinct), "body")
+        user_rows.append({"name": full_name, "cells": cells})
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    money_font = Font(bold=True, size=10, color="155F00")
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+        for i, f in enumerate(fields):
+            v, kind = row["cells"].get(f.get("key", ""), (_DASH, "muted"))
+            font = (
+                money_font if kind == "money"
+                else _NAME_FONT if kind == "num"
+                else _BODY_FONT if kind == "body"
+                else _MUTED_FONT
+            )
+            align = _CENTER if kind in ("num", "money") else _LEFT_TOP_WRAP
+            _put(ws, row_idx, 3 + i, v, font=font, fill=_ROW_FILL, align=align)
+        row_idx += 1
+
+    # Total row.
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_LEFT_TOP_WRAP)
+        for i, f in enumerate(fields):
+            cells = [r["cells"].get(f.get("key", ""), (_DASH, "muted")) for r in user_rows]
+            kinds = {k for _, k in cells}
+            # Sum numeric/money columns; for text columns show count of distinct values.
+            if "money" in kinds:
+                total = sum(
+                    n for v, k in cells if k == "money"
+                    for n in _extract_numbers_text(str(v).replace("₹", "").replace(",", ""))
+                )
+                _put(ws, row_idx, 3 + i, _format_revenue(total) if total else "₹0",
+                     font=money_font, fill=_TOTAL_FILL, align=_CENTER)
+            elif "num" in kinds and "body" not in kinds:
+                total = sum(v for v, k in cells if k == "num" and isinstance(v, (int, float)))
+                disp = int(total) if float(total).is_integer() else round(total, 2)
+                _put(ws, row_idx, 3 + i, disp, font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_CENTER)
+            elif "body" in kinds:
+                # Count distinct text values across employees.
+                all_vals = set()
+                for v, k in cells:
+                    if k == "body" and isinstance(v, str):
+                        for piece in v.split(","):
+                            p = piece.strip()
+                            if p:
+                                all_vals.add(p.lower())
+                _put(ws, row_idx, 3 + i, len(all_vals) if all_vals else _DASH,
+                     font=_TOTAL_FONT if all_vals else _MUTED_FONT,
+                     fill=_TOTAL_FILL, align=_CENTER)
+            else:
+                _put(ws, row_idx, 3 + i, _DASH,
+                     font=_MUTED_FONT, fill=_TOTAL_FILL, align=_CENTER)
+
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_combined_summary_sheet(ws, other_groups, *, range_label: str, today_label: str):
+    """One-table combined summary for every department except Sales & Inside
+    Sales (those get their own detailed tabs).  Columns:
+    Department | # | Employee | Focus Area | Key Activities.
+    """
+    last_col = 6
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 20   # Department
+    ws.column_dimensions["C"].width = 5    # #
+    ws.column_dimensions["D"].width = 22   # Employee
+    ws.column_dimensions["E"].width = 22   # Focus Area (role)
+    ws.column_dimensions["F"].width = 80   # Key Activities (wider since it's the tail)
+
+    n_employees = sum(len(g["users"]) for g in other_groups)
+    n_reports = sum(len(rs) for g in other_groups for rs in g["users"].values())
+
+    _merge_title(
+        ws, 1, last_col,
+        "All Department Employee Summary (other departments)",
+        _TITLE_FONT,
+    )
+    ws.row_dimensions[1].height = 28
+    subtitle = (
+        f"Date range: {range_label}  |  "
+        f"{n_employees} employees across {len(other_groups)} departments  |  "
+        f"{n_reports} reports  |  Generated: {today_label}  "
+        f"(Inside Sales & Sales shown on their own detailed tabs)"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Department", "#", "Employee", "Focus Area",
+        f"Key Activities ({range_label})",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    sorted_groups = sorted(other_groups, key=_dept_sort_key)
+
+    row_idx = 5
+    for group in sorted_groups:
+        d = group["dept"]
+        dept_name = d.name if d else "No Department"
+        user_entries = []
+        for _, user_reports in group["users"].items():
+            sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+            user_entries.append(_summarise_user_reports(sorted_reports))
+        user_entries.sort(key=lambda t: t[0].lower())
+
+        for idx, (name, role, key_acts, _meetings, _revenue, _count) in enumerate(user_entries, start=1):
+            # Department badge only on first row of the dept block.
+            if idx == 1:
+                _put(ws, row_idx, 2, dept_name,
+                     font=_BADGE_FONT, fill=_BADGE_FILL, align=_CENTER)
+            else:
+                _put(ws, row_idx, 2, "", fill=_ROW_FILL)
+            _put(ws, row_idx, 3, idx, font=_BODY_FONT, fill=_ROW_FILL, align=_CENTER)
+            _put(ws, row_idx, 4, name, font=_NAME_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+            _put(ws, row_idx, 5, role or _DASH,
+                 font=_BODY_FONT if role else _MUTED_FONT,
+                 fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+            _put(ws, row_idx, 6, key_acts or _DASH,
+                 font=_BODY_FONT if key_acts else _MUTED_FONT,
+                 fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+            row_idx += 1
+
+    ws.freeze_panes = "D5"
+    _set_print_landscape_fit(ws)
+
+
 def _empty_xlsx(filename: str) -> Response:
     wb = Workbook()
     ws = wb.active
@@ -617,6 +861,128 @@ def _empty_xlsx(filename: str) -> Response:
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Length": str(len(data)),
+        },
+    )
+
+
+@router.get("/export.csv")
+def export_csv(
+    employee: int | None = Query(None, description="Filter by employee id"),
+    department: str | None = Query(None, description="Filter by department slug"),
+    start: date_type | None = Query(None, description="Inclusive start date"),
+    end: date_type | None = Query(None, description="Inclusive end date"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Single-file CSV mirror of the styled XLSX summary.
+
+    Columns: Department, Employee, Role, Key Activities, Meetings, Revenue (₹).
+    Rows ordered Sales → Inside Sales → other departments alphabetically.
+    Key Activities lines are joined with " | " so each row stays on one line
+    in spreadsheet apps that don't auto-wrap.  UTF-8 with BOM so Excel
+    detects the encoding correctly on Windows.
+    """
+    q = db.query(DailyReport).join(User, DailyReport.user_id == User.id)
+    if employee is not None:
+        q = q.filter(DailyReport.user_id == employee)
+    if department:
+        dept = db.query(Department).filter(Department.slug == department).first()
+        if not dept:
+            return _empty_csv("daily-reports.csv")
+        q = q.filter(User.department_id == dept.id)
+    if start:
+        q = q.filter(DailyReport.date >= start)
+    if end:
+        q = q.filter(DailyReport.date <= end)
+
+    rows = (
+        q.order_by(DailyReport.date.desc(), DailyReport.user_id)
+        .limit(50000)
+        .all()
+    )
+
+    by_dept: dict[int | None, dict] = {}
+    for r in rows:
+        if (r.data or {}).get("__leave__") == "1":
+            continue
+        u = r.user
+        d = u.department if u else None
+        key = d.id if d else None
+        if key not in by_dept:
+            by_dept[key] = {"dept": d, "users": {}}
+        by_dept[key]["users"].setdefault(u.id if u else 0, []).append(r)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    range_label = _format_range_label(start, end)
+    writer.writerow([f"All Department Employee Summary Report — {range_label}"])
+    writer.writerow([])
+    writer.writerow(
+        ["Department", "Employee", "Role / Designation", "Key Activities", "Meetings", "Revenue (₹)"]
+    )
+
+    for group in sorted(by_dept.values(), key=_dept_sort_key):
+        d = group["dept"]
+        dept_name = d.name if d else "No Department"
+        # Sort users in each dept by name.
+        user_entries = []
+        for _, user_reports in group["users"].items():
+            sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+            user_entries.append(_summarise_user_reports(sorted_reports))
+        user_entries.sort(key=lambda t: t[0].lower())
+
+        for name, role, key_acts, meetings, revenue, _count in user_entries:
+            # Collapse multi-line activities into one CSV cell (single line).
+            key_acts_line = (key_acts or "").replace("\n", " | ")
+            meetings_str = ""
+            if meetings is not None:
+                meetings_str = (
+                    str(int(meetings))
+                    if float(meetings).is_integer()
+                    else f"{meetings:.2f}"
+                )
+            revenue_str = _format_revenue(revenue) if revenue is not None else ""
+            writer.writerow([
+                dept_name,
+                name,
+                role or "",
+                key_acts_line,
+                meetings_str,
+                revenue_str,
+            ])
+        # Blank separator row between departments for visual breathing room.
+        writer.writerow([])
+
+    # UTF-8 BOM helps Excel for Windows pick the right encoding.
+    payload = buf.getvalue().encode("utf-8-sig")
+
+    parts = ["daily-reports"]
+    if start:
+        parts.append(start.isoformat())
+    if end:
+        parts.append(end.isoformat())
+    if not (start or end):
+        parts.append(date_type.today().isoformat())
+    filename = "_".join(parts) + ".csv"
+
+    return Response(
+        content=payload,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
+        },
+    )
+
+
+def _empty_csv(filename: str) -> Response:
+    payload = "No reports match the current filters.\n".encode("utf-8-sig")
+    return Response(
+        content=payload,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload)),
         },
     )
 
