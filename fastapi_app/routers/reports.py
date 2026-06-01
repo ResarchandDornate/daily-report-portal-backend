@@ -129,18 +129,20 @@ def list_reports(
 
 _DASH = "—"
 
-_TITLE_FONT = Font(bold=True, size=16, color="1A1A1A")
+# Colour palette mirrors the on-screen "summary table" component so the
+# downloaded XLSX is visually identical to the dashboard view.
+_TITLE_FONT = Font(bold=True, size=16, color="1B5E8B")          # blue title
 _SUBTITLE_FONT = Font(size=10, color="666666", italic=True)
 _HEADER_FONT = Font(bold=True, size=10, color="FFFFFF")
-_HEADER_FILL = PatternFill("solid", fgColor="1A2A3A")
-_NAME_FONT = Font(bold=True, size=10, color="1A1A1A")
+_HEADER_FILL = PatternFill("solid", fgColor="1A2A3A")           # navy header
+_NAME_FONT = Font(size=10, color="1A1A1A")                       # employee names
 _BADGE_FONT = Font(bold=True, size=9, color="1B5E8B")
 _BADGE_FILL = PatternFill("solid", fgColor="D6E8F5")
-_BODY_FONT = Font(size=9, color="333333")
-_MUTED_FONT = Font(size=9, color="888888")
-_ROW_FILL = PatternFill("solid", fgColor="FAFAFA")
-_TOTAL_FONT = Font(bold=True, size=10, color="1A1A1A")
-_TOTAL_FILL = PatternFill("solid", fgColor="E8EEF5")
+_BODY_FONT = Font(size=10, color="1A1A1A")
+_MUTED_FONT = Font(size=10, color="888888")
+_ROW_FILL = PatternFill("solid", fgColor="FFFFFF")              # white rows
+_TOTAL_FONT = Font(bold=True, size=10, color="1B5E8B")          # navy bold totals
+_TOTAL_FILL = PatternFill("solid", fgColor="EAF1F8")            # subtle blue total bar
 _LEFT_TOP_WRAP = Alignment(horizontal="left", vertical="top", wrap_text=True)
 _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
@@ -150,6 +152,14 @@ _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _MEETING_LABEL_RE = re.compile(r"\b(meeting|call|visit|enquir)", re.I)
 _REVENUE_LABEL_RE = re.compile(
     r"\b(revenue|amount|invoice|sales|rupees|payment|earning|₹)", re.I
+)
+# Broad numeric-label hint — any column whose label reads like a counter or
+# amount.  Used by the per-dept detail sheet to decide which columns to sum.
+_NUMERIC_LABEL_RE = re.compile(
+    r"\b(no\.?|number|count|total|amount|revenue|calls?|meetings?|enquiries|"
+    r"leads?|companies|visits?|orders?|hours?|sum|rate|₹|rs\.?|inr|amt|pis?|"
+    r"picked|closed|lost|following|invoice|sent|shared|received|made|type|works?)\b",
+    re.I,
 )
 # Number token: handles thousand-separator commas, optional decimals, and
 # detects trailing ordinal suffix so "25th" / "1st" can be skipped.
@@ -268,12 +278,21 @@ def _summarise_user_reports(reports):
                 continue
             seen.add(key_lower)
             distinct.append(v)
-        joined = ", ".join(distinct[:12])
-        if len(distinct) > 12:
-            joined += f" (+{len(distinct) - 12} more)"
+        # Keep the cell tight: at most 2 distinct values per field, each
+        # trimmed to 40 chars, "(+N more)" hints at the rest.
+        trimmed = []
+        for v in distinct[:2]:
+            trimmed.append(v if len(v) <= 40 else v[:37].rstrip() + "…")
+        joined = ", ".join(trimmed)
+        if len(distinct) > 2:
+            joined += f" (+{len(distinct) - 2} more)"
         activity_chunks.append(f"{label}: {joined}")
 
+    # Cell-level cap so even employees with many fields stay on 1-2 lines.
     key_activities = "\n".join(activity_chunks) if activity_chunks else ""
+    _MAX_ACTIVITIES_LEN = 200
+    if len(key_activities) > _MAX_ACTIVITIES_LEN:
+        key_activities = key_activities[: _MAX_ACTIVITIES_LEN - 1].rstrip() + "…"
     return full_name, role, key_activities, meetings_total, revenue_total, len(reports)
 
 
@@ -344,6 +363,8 @@ def export_xlsx(
     #                             employee with consolidated Key Activities)
     sales_group = None
     inside_sales_group = None
+    service_group = None
+    project_group = None
     other_groups = []
     for group in by_dept.values():
         slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
@@ -351,6 +372,10 @@ def export_xlsx(
             sales_group = group
         elif slug == "insideSales":
             inside_sales_group = group
+        elif slug == "service":
+            service_group = group
+        elif slug == "project":
+            project_group = group
         else:
             other_groups.append(group)
 
@@ -361,6 +386,14 @@ def export_xlsx(
     if inside_sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Inside Sales — Detail"))
         _build_dept_detail_sheet(ws, inside_sales_group, range_label=range_label)
+
+    if service_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Service — Detail"))
+        _build_service_detail_sheet(ws, service_group, range_label=range_label)
+
+    if project_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Project — Detail"))
+        _build_project_detail_sheet(ws, project_group, range_label=range_label)
 
     if other_groups:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
@@ -685,7 +718,7 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str):
                 cells[key] = (_DASH, "muted")
                 continue
             # Decide numeric vs text by label hint OR strict parse.
-            if _NUMBER_TOKEN_RE.search(label) or _MEETING_LABEL_RE.search(label) or _REVENUE_LABEL_RE.search(label):
+            if _NUMERIC_LABEL_RE.search(label) or _MEETING_LABEL_RE.search(label) or _REVENUE_LABEL_RE.search(label):
                 total = sum(n for _, v in non_empty for n in _extract_numbers_text(v))
                 is_money = bool(_REVENUE_LABEL_RE.search(label))
                 if is_money:
@@ -708,53 +741,70 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str):
                     disp = int(total) if float(total).is_integer() else round(total, 2)
                     cells[key] = (disp, "num")
                 else:
-                    # Text — comma-join distinct values.
+                    # Text — keep it compact: 4 distinct values, each ≤ 30
+                    # chars, with "(+N more)" hint, and an overall 120-char
+                    # cap so the cell never blows out the row.
                     seen, distinct = set(), []
                     for _, v in non_empty:
                         if v.lower() in seen:
                             continue
                         seen.add(v.lower())
                         distinct.append(v)
-                    cells[key] = (", ".join(distinct), "body")
+                    trimmed = []
+                    for v in distinct[:4]:
+                        trimmed.append(v if len(v) <= 30 else v[:27].rstrip() + "…")
+                    text = ", ".join(trimmed)
+                    if len(distinct) > 4:
+                        text += f" (+{len(distinct) - 4} more)"
+                    if len(text) > 120:
+                        text = text[:119].rstrip() + "…"
+                    cells[key] = (text, "body")
         user_rows.append({"name": full_name, "cells": cells})
     user_rows.sort(key=lambda r: r["name"].lower())
 
-    money_font = Font(bold=True, size=10, color="155F00")
+    # Matches the on-screen "Inside Sales — summary table" look: clean data
+    # rows (no green tint on money), right-aligned numbers, navy bold totals.
+    num_font = Font(size=10, color="1A1A1A")
+    money_data_font = Font(size=10, color="1A1A1A")
+    total_navy_font = Font(bold=True, size=10, color="1B5E8B")
+    right_align = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
     row_idx = 5
     for row in user_rows:
-        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
         for i, f in enumerate(fields):
             v, kind = row["cells"].get(f.get("key", ""), (_DASH, "muted"))
-            font = (
-                money_font if kind == "money"
-                else _NAME_FONT if kind == "num"
-                else _BODY_FONT if kind == "body"
-                else _MUTED_FONT
-            )
-            align = _CENTER if kind in ("num", "money") else _LEFT_TOP_WRAP
-            _put(ws, row_idx, 3 + i, v, font=font, fill=_ROW_FILL, align=align)
+            if kind == "money":
+                _put(ws, row_idx, 3 + i, v, font=money_data_font, fill=_ROW_FILL, align=right_align)
+            elif kind == "num":
+                _put(ws, row_idx, 3 + i, v, font=num_font, fill=_ROW_FILL, align=right_align)
+            elif kind == "body":
+                _put(ws, row_idx, 3 + i, v, font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
+            else:
+                _put(ws, row_idx, 3 + i, v, font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
         row_idx += 1
 
-    # Total row.
+    # Total row — navy bold text on light-blue fill for every cell.
     if user_rows:
-        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_LEFT_TOP_WRAP)
+        _put(ws, row_idx, 2, "Total",
+             font=total_navy_font, fill=_TOTAL_FILL, align=body_left)
         for i, f in enumerate(fields):
             cells = [r["cells"].get(f.get("key", ""), (_DASH, "muted")) for r in user_rows]
             kinds = {k for _, k in cells}
-            # Sum numeric/money columns; for text columns show count of distinct values.
             if "money" in kinds:
                 total = sum(
                     n for v, k in cells if k == "money"
                     for n in _extract_numbers_text(str(v).replace("₹", "").replace(",", ""))
                 )
                 _put(ws, row_idx, 3 + i, _format_revenue(total) if total else "₹0",
-                     font=money_font, fill=_TOTAL_FILL, align=_CENTER)
+                     font=total_navy_font, fill=_TOTAL_FILL, align=right_align)
             elif "num" in kinds and "body" not in kinds:
                 total = sum(v for v, k in cells if k == "num" and isinstance(v, (int, float)))
                 disp = int(total) if float(total).is_integer() else round(total, 2)
-                _put(ws, row_idx, 3 + i, disp, font=_TOTAL_FONT, fill=_TOTAL_FILL, align=_CENTER)
+                _put(ws, row_idx, 3 + i, disp,
+                     font=total_navy_font, fill=_TOTAL_FILL, align=right_align)
             elif "body" in kinds:
-                # Count distinct text values across employees.
                 all_vals = set()
                 for v, k in cells:
                     if k == "body" and isinstance(v, str):
@@ -763,11 +813,205 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str):
                             if p:
                                 all_vals.add(p.lower())
                 _put(ws, row_idx, 3 + i, len(all_vals) if all_vals else _DASH,
-                     font=_TOTAL_FONT if all_vals else _MUTED_FONT,
+                     font=total_navy_font if all_vals else _MUTED_FONT,
                      fill=_TOTAL_FILL, align=_CENTER)
             else:
                 _put(ws, row_idx, 3 + i, _DASH,
                      font=_MUTED_FONT, fill=_TOTAL_FILL, align=_CENTER)
+
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_service_detail_sheet(ws, group, *, range_label: str):
+    """Service department — 3 aggregated columns instead of one per
+    report_field.  Combines the underlying daily fields so HR sees totals
+    for site visits, inverter complaints, and part replacements per
+    employee.
+    """
+    last_col = 5  # A margin + B Employee + C Site Visit + D Inv Complaint + E Parts Repl
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 26
+    ws.column_dimensions["E"].width = 26
+
+    _merge_title(ws, 1, last_col, "Service — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = ["Employee", "Total Site Visit", "Total Inverter Complaint", "Inverter Parts Replacement"]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # Aggregation rules:
+    #   Total Site Visit         = Solar Install visits + Inverter Complaint visits
+    #   Total Inverter Complaint = Complaint site visits + Complaint tele/video
+    #   Inverter Parts Replace   = Inverter Part Replacement
+    SITE_VISIT_KEYS = ("solarInstallationSiteVisit", "inverterComplaintSiteVisit")
+    INV_COMPLAINT_KEYS = ("inverterComplaintSiteVisit", "inverterComplaintTeleVideo")
+    PARTS_REPL_KEYS = ("inverterPartReplacement",)
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        def sum_keys(keys):
+            total = 0.0
+            for r in sorted_reports:
+                data = r.data or {}
+                for k in keys:
+                    for n in _extract_numbers_text(data.get(k, "")):
+                        total += n
+            return total
+
+        user_rows.append({
+            "name": full_name,
+            "site_visit": sum_keys(SITE_VISIT_KEYS),
+            "inv_complaint": sum_keys(INV_COMPLAINT_KEYS),
+            "parts_repl": sum_keys(PARTS_REPL_KEYS),
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    def _disp(n):
+        return int(n) if float(n).is_integer() else round(n, 2)
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        for i, key in enumerate(("site_visit", "inv_complaint", "parts_repl")):
+            _put(ws, row_idx, 3 + i, _disp(row[key]),
+                 font=num_font, fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        for i, key in enumerate(("site_visit", "inv_complaint", "parts_repl")):
+            total = sum(r[key] for r in user_rows)
+            _put(ws, row_idx, 3 + i, _disp(total),
+                 font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_project_detail_sheet(ws, group, *, range_label: str):
+    """Project department — 2 condensed columns:
+      - Total Site Visit  (count of reports the employee submitted)
+      - Work on Site      (distinct snippets from Work Done + Work in Progress,
+                           short list)
+    """
+    last_col = 4  # A margin + B Employee + C Total Site Visit + D Work on Site
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 90
+
+    _merge_title(ws, 1, last_col, "Project — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = ["Employee", "Total Site Visit", "Work on Site"]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    WORK_KEYS = ("workDone", "workInProgress")
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        # Site visit count = number of reports submitted in range.
+        visit_count = len(sorted_reports)
+
+        # Work on Site — keep it tight: 2 distinct snippets, each ≤ 40 chars,
+        # whole cell capped at 150 chars.  Long histories collapse to
+        # "(+N more)" so the row stays one or two visible lines.
+        seen = set()
+        distinct = []
+        for r in sorted_reports:
+            data = r.data or {}
+            for k in WORK_KEYS:
+                v = (data.get(k) or "").strip()
+                if not v or v.lower() == "on leave":
+                    continue
+                key_lower = v.lower()
+                if key_lower in seen:
+                    continue
+                seen.add(key_lower)
+                distinct.append(v)
+        trimmed = []
+        for v in distinct[:2]:
+            trimmed.append(v if len(v) <= 40 else v[:37].rstrip() + "…")
+        work_text = ", ".join(trimmed)
+        if len(distinct) > 2:
+            work_text += f" (+{len(distinct) - 2} more)"
+        if len(work_text) > 150:
+            work_text = work_text[:149].rstrip() + "…"
+
+        user_rows.append({
+            "name": full_name,
+            "visit_count": visit_count,
+            "work_text": work_text or _DASH,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 3, row["visit_count"], font=num_font, fill=_ROW_FILL, align=right_align)
+        _put(ws, row_idx, 4,
+             row["work_text"],
+             font=_BODY_FONT if row["work_text"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        _put(ws, row_idx, 3,
+             sum(r["visit_count"] for r in user_rows),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+        _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
 
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
