@@ -439,6 +439,9 @@ def export_xlsx(
     project_group = None
     marketing_group = None
     production_group = None
+    logistics_group = None
+    design_group = None
+    procurement_group = None
     other_groups = []
     for group in by_dept.values():
         slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
@@ -454,6 +457,12 @@ def export_xlsx(
             marketing_group = group
         elif slug == "production":
             production_group = group
+        elif slug == "logistics":
+            logistics_group = group
+        elif slug == "design":
+            design_group = group
+        elif slug == "procurement":
+            procurement_group = group
         else:
             other_groups.append(group)
 
@@ -484,6 +493,18 @@ def export_xlsx(
     if production_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Production — Detail"))
         _build_production_detail_sheet(ws, production_group, range_label=range_label)
+
+    if logistics_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Logistics — Detail"))
+        _build_logistics_detail_sheet(ws, logistics_group, range_label=range_label)
+
+    if design_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Design — Detail"))
+        _build_design_detail_sheet(ws, design_group, range_label=range_label)
+
+    if procurement_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Procurement — Detail"))
+        _build_procurement_detail_sheet(ws, procurement_group, range_label=range_label)
 
     if other_groups:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
@@ -1025,6 +1046,516 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
         for i, key in enumerate(("site_visit", "inv_complaint", "parts_repl")):
             total = sum(r[key] for r in user_rows)
             _put(ws, row_idx, 3 + i, _disp(total),
+                 font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_procurement_detail_sheet(ws, group, *, range_label: str):
+    """Procurement department — 5 aggregated counter columns.
+
+    Each metric is read two ways and the larger value wins:
+      1. Explicit "X Sent – N" / "PO Created – 3" markers in the text.
+      2. A pattern-count fallback (e.g. number of PO/OAPL/… IDs found,
+         or number of days with content in that field).
+    """
+    last_col = 7
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 22
+    widths = [14, 16, 22, 16, 16]
+    for i, w in enumerate(widths, start=3):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    _merge_title(ws, 1, last_col, "Procurement — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Employee", "Enquiries Done", "Negotiations",
+        "Vendor Meetings / New Vendors", "POs Created", "NOPAs Created",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 32
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # Field key candidates per the report-field labels in the DB.
+    ENQUIRY_KEYS    = ("enquiriesForPricing", "enquiriesForPricingDone")
+    NEGOT_KEYS      = ("comparisonAndNegotiations", "comparisonNegotiations")
+    VENDOR_KEYS     = ("vendorOnboardingMeeting", "vendorOnboarding", "vendorMeeting")
+    PO_KEYS         = ("purchaseOrderProcess", "poProcess")
+    NOPA_KEYS       = ("paymentProcessNopa", "paymentProcess", "nopaProcess")
+
+    # Explicit "keyword – N" patterns.  Look for the keyword followed by an
+    # en-dash / hyphen / colon and a number; sum every match in the cell.
+    def _build_count_re(*words):
+        word_alt = "|".join(words)
+        return re.compile(
+            rf"\b(?:{word_alt})\w*\s*[–\-:]\s*(\d+)",
+            re.I,
+        )
+
+    ENQUIRY_RE   = _build_count_re("inquir", "inquir(?:y|ies)\\s*sent", "rfq")
+    NEGOT_RE     = _build_count_re("negotiat", "comparison", "rate negotiat")
+    VENDOR_RE    = _build_count_re(
+        "meeting", "vendor coordination", "vendor onboarding",
+        "vendor registration", "new vendor",
+    )
+    PO_NUM_RE    = _build_count_re("po created", "po generated", "purchase order")
+    NOPA_NUM_RE  = _build_count_re("nopa created", "nopa processed", "nopa generated")
+
+    # Distinct-ID fallback patterns (PO/OAPL/2627/0073, NOPA/OAPL/2526/0721/4)
+    PO_ID_RE   = re.compile(r"\bPO/[A-Z]+/\d+/\d+\b", re.I)
+    NOPA_ID_RE = re.compile(r"\bNOPA/[A-Z]+/\d+/\d+(?:/\d+)?\b", re.I)
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
+
+    def _sum_explicit(text, pattern):
+        if not text:
+            return 0
+        total = 0
+        for m in pattern.finditer(text):
+            try:
+                total += int(m.group(1))
+            except (ValueError, IndexError):
+                pass
+        return total
+
+    def _count_days(text_list):
+        return sum(1 for t in text_list if _has_content(t))
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        # Pool text per field-group across all reports.
+        enquiry_texts, negot_texts, vendor_texts, po_texts, nopa_texts = [], [], [], [], []
+        for r in sorted_reports:
+            data = r.data or {}
+            for k in ENQUIRY_KEYS:
+                enquiry_texts.append(str(data.get(k, "") or ""))
+            for k in NEGOT_KEYS:
+                negot_texts.append(str(data.get(k, "") or ""))
+            for k in VENDOR_KEYS:
+                vendor_texts.append(str(data.get(k, "") or ""))
+            for k in PO_KEYS:
+                po_texts.append(str(data.get(k, "") or ""))
+            for k in NOPA_KEYS:
+                nopa_texts.append(str(data.get(k, "") or ""))
+
+        enq_text   = " ".join(enquiry_texts)
+        neg_text   = " ".join(negot_texts)
+        ven_text   = " ".join(vendor_texts)
+        po_text    = " ".join(po_texts)
+        nopa_text  = " ".join(nopa_texts)
+
+        # Each metric: take MAX of (explicit "—N" sum, fallback count).
+        # Fallbacks: distinct PO/NOPA IDs for those columns; days-with-content
+        # for the narrative columns.
+        enq_count = max(_sum_explicit(enq_text, ENQUIRY_RE), _count_days(enquiry_texts))
+        neg_count = max(_sum_explicit(neg_text, NEGOT_RE), _count_days(negot_texts))
+        ven_count = max(_sum_explicit(ven_text, VENDOR_RE), _count_days(vendor_texts))
+        po_count   = max(_sum_explicit(po_text,  PO_NUM_RE),   len(set(PO_ID_RE.findall(po_text))))
+        nopa_count = max(_sum_explicit(nopa_text, NOPA_NUM_RE), len(set(NOPA_ID_RE.findall(nopa_text))))
+
+        user_rows.append({
+            "name": full_name,
+            "enquiries": enq_count,
+            "negotiations": neg_count,
+            "vendor_meetings": ven_count,
+            "pos": po_count,
+            "nopas": nopa_count,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    NUMERIC_KEYS = ("enquiries", "negotiations", "vendor_meetings", "pos", "nopas")
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        for i, key in enumerate(NUMERIC_KEYS, start=3):
+            _put(ws, row_idx, i, row[key], font=num_font, fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        for i, key in enumerate(NUMERIC_KEYS, start=3):
+            _put(ws, row_idx, i,
+                 sum(r[key] for r in user_rows),
+                 font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_design_detail_sheet(ws, group, *, range_label: str):
+    """Design department — 3 aggregated columns:
+      - Projects (names + counts) extracted from the Design field text
+      - Designs Made (count of distinct design entries)
+      - Site Visits (count of days with real content in Site Survey & Visit)
+    """
+    last_col = 6
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 22   # Employee
+    ws.column_dimensions["C"].width = 70   # Projects (names + counts)
+    ws.column_dimensions["D"].width = 14   # Total Projects
+    ws.column_dimensions["E"].width = 16   # Designs Made
+    ws.column_dimensions["F"].width = 14   # Site Visits
+
+    _merge_title(ws, 1, last_col, "Design — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Employee", "Projects (with mention count)",
+        "Total Projects", "Designs Made", "Site Visits",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # Known project / site names — extracted by case-insensitive match.
+    # If new ones appear in the data, add them here.
+    PROJECT_NAMES = [
+        "Muzaffarnagar", "Khaithwadi", "Kaithwadi", "Sihari", "Simbhalki",
+        "Lilasons", "Vales Function", "Tusara", "Mavikala", "Mavikalan",
+        "Kamala", "Titroda", "Padams", "Padom", "NTPC", "Ledure",
+        "G-Plast", "Vardhmaan", "Vardhman", "Faze", "Panipat", "Rooftop",
+        "Goa", "Sumati", "Holy Family", "Inroof", "Codal", "Bigwit",
+        "Suryagrid",
+    ]
+
+    # Capacity-anchored fallback: pulls the site word right after a MW/kWp.
+    CAPACITY_SITE_RE = re.compile(
+        r"\d+(?:\.\d+)?\s*(?:MWp|MW|kWp|kW)\b[\s\-]*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
+    )
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
+
+    # Field key candidates — design dept uses these labels per the PDF.
+    DESIGN_KEYS      = ("design",)
+    SITE_VISIT_KEYS  = ("siteSurveyVisit", "siteVisit", "siteSurveyAndVisit")
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        design_text_pool = []
+        designs_count = 0
+        site_visit_days = 0
+        for r in sorted_reports:
+            data = r.data or {}
+            for k in DESIGN_KEYS:
+                v = data.get(k, "") or ""
+                if _has_content(v):
+                    design_text_pool.append(str(v))
+                    # Count distinct design entries (split on commas, periods,
+                    # semicolons, newlines and count non-empty fragments).
+                    fragments = [
+                        f.strip() for f in re.split(r"[\n.;]+", str(v))
+                        if f.strip() and len(f.strip()) > 4
+                    ]
+                    designs_count += len(fragments)
+            if any(_has_content(data.get(k, "")) for k in SITE_VISIT_KEYS):
+                site_visit_days += 1
+
+        # Project name extraction: look up known names + capacity-anchored fallback.
+        big_design_text = " ".join(design_text_pool)
+        project_counts: dict[str, int] = {}
+        for name in PROJECT_NAMES:
+            c = len(re.findall(rf"\b{re.escape(name)}\b", big_design_text, re.I))
+            if c > 0:
+                project_counts[name] = project_counts.get(name, 0) + c
+        # Capacity-anchored matches (catches names not in the list).
+        for m in CAPACITY_SITE_RE.finditer(big_design_text):
+            cap = m.group(1).strip()
+            # Skip if already covered by an explicit name match.
+            if any(cap.lower() in k.lower() or k.lower() in cap.lower() for k in project_counts):
+                continue
+            project_counts[cap] = project_counts.get(cap, 0) + 1
+
+        sorted_projects = sorted(project_counts.items(), key=lambda x: -x[1])[:6]
+        projects_text = ", ".join(f"{n}: {c}" for n, c in sorted_projects) or _DASH
+        total_projects = len(project_counts)
+
+        user_rows.append({
+            "name": full_name,
+            "projects": projects_text,
+            "total_projects": total_projects,
+            "designs_made": designs_count,
+            "site_visits": site_visit_days,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 3, row["projects"],
+             font=_BODY_FONT if row["projects"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 4, row["total_projects"], font=num_font, fill=_ROW_FILL, align=right_align)
+        _put(ws, row_idx, 5, row["designs_made"], font=num_font, fill=_ROW_FILL, align=right_align)
+        _put(ws, row_idx, 6, row["site_visits"], font=num_font, fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        _put(ws, row_idx, 3, "", fill=_TOTAL_FILL)
+        # Total Projects in the footer = count of DISTINCT projects across
+        # all employees (not the sum of each row, which would double-count
+        # shared projects).
+        all_projects: set[str] = set()
+        for row in user_rows:
+            if row["projects"] == _DASH:
+                continue
+            for chunk in row["projects"].split(","):
+                name = chunk.split(":")[0].strip().lower()
+                if name:
+                    all_projects.add(name)
+        _put(ws, row_idx, 4, len(all_projects),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+        _put(ws, row_idx, 5,
+             sum(r["designs_made"] for r in user_rows),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+        _put(ws, row_idx, 6,
+             sum(r["site_visits"] for r in user_rows),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_logistics_detail_sheet(ws, group, *, range_label: str):
+    """Logistics department — 9 aggregated columns extracted from the
+    free-text daily fields.  Each cell turns paragraphs of activity into
+    a useful tally (transporter/warehouse names with hit counts, invoice
+    counts, day counts, etc.).
+    """
+    last_col = 11
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 22                    # Employee
+    widths = [44, 44, 14, 18, 12, 14, 14, 14, 14]           # 9 data columns
+    for i, w in enumerate(widths, start=3):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    _merge_title(ws, 1, last_col, "Logistics — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Employee",
+        "Transporter Coordination",
+        "Warehouse Coordination",
+        "Courier Tracking",
+        "Stock / Flasher Invoices",
+        "Verified Bills",
+        "Portal Works (days)",
+        "Booked Vehicles",
+        "Coordination Calls",
+        "Courier Dispatch",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 32
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # Known names — looked up case-insensitively in the free-text logs.
+    TRANSPORTERS = [
+        "Trackon", "Allcargo", "All Cargo", "Delhivery", "Truxcargo",
+        "Trux Cargo", "WheelsEye", "Wheels Eye", "Rivigo", "FEDEX",
+        "Aryan", "TCI", "Porter", "Bike Porter",
+    ]
+    WAREHOUSES = [
+        "AQDAS", "Logiwiz", "Rama", "MJ Infa", "Yusen", "Chennai",
+        "Pune", "Ludhiana", "Nhava Sheva", "Maharashtra", "Okhla",
+        "Bikaner", "Delhi warehouse",
+    ]
+
+    # Invoice numbers look like OS-MAY26-040-DL, DC-MAY26-0009-DL, OS-APR26-072-DL
+    INVOICE_RE = re.compile(r"\b(?:OS|DC)-[A-Z]{3}\d{2}-[\dA-Z\-]+", re.I)
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
+
+    def _count_hits(names, text):
+        """Returns dict {display_name: count} for each known name seen in text."""
+        if not text:
+            return {}
+        out = {}
+        for n in names:
+            c = len(re.findall(rf"\b{re.escape(n)}\b", text, re.I))
+            if c > 0:
+                out[n] = out.get(n, 0) + c
+        return out
+
+    def _format_names_with_counts(counts, top=5):
+        if not counts:
+            return _DASH
+        sorted_items = sorted(counts.items(), key=lambda x: -x[1])[:top]
+        return ", ".join(f"{name}: {c}" for name, c in sorted_items)
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        # Build pooled text buffers per area so we can scan them once.
+        transporter_text = []
+        warehouse_text = []
+        shipment_text = []
+        stock_text = []
+        other_op_text = []
+        coord_calls_text = []
+        courier_dispatch_text = []
+        portal_days = 0
+        for r in sorted_reports:
+            data = r.data or {}
+            transporter_text.append(str(data.get("truckTransportationCoordination", "") or ""))
+            warehouse_text.append(str(data.get("warehouseCoordination", "") or ""))
+            shipment_text.append(str(data.get("shipmentTracking", "") or ""))
+            for k in ("stockIn", "stockOut", "flasherDataUpload"):
+                stock_text.append(str(data.get(k, "") or ""))
+            other_op_text.append(str(data.get("otherOperationalWork", "") or ""))
+            coord_calls_text.append(str(data.get("freightSharingDetails", "") or ""))
+            courier_dispatch_text.append(str(data.get("courierDispatch", "") or ""))
+            if _has_content(data.get("portalOperations", "")):
+                portal_days += 1
+
+        tt = " ".join(transporter_text)
+        wh = " ".join(warehouse_text)
+        sh = " ".join(shipment_text)
+        st = " ".join(stock_text)
+        op = " ".join(other_op_text)
+        cc = " ".join(coord_calls_text)
+        cd = " ".join(courier_dispatch_text)
+
+        transporter_counts = _count_hits(TRANSPORTERS, tt)
+        warehouse_counts = _count_hits(WAREHOUSES, wh)
+
+        courier_tracking_count = len(set(INVOICE_RE.findall(sh)))
+        stock_invoices_count = len(set(INVOICE_RE.findall(st)))
+        verified_bills_count = len(re.findall(r"\bverif\w*", op, re.I))
+        booked_vehicles_count = len(re.findall(r"\bbook(?:ed|ing)?\b", tt, re.I))
+        coord_calls_count = len(re.findall(
+            r"\b(?:call(?:ed|s)?|spoke|communicated|coordinated|coordination)\b",
+            cc, re.I,
+        ))
+        courier_dispatch_count = len(set(INVOICE_RE.findall(cd)))
+
+        user_rows.append({
+            "name": full_name,
+            "transporter": _format_names_with_counts(transporter_counts),
+            "warehouse": _format_names_with_counts(warehouse_counts),
+            "courier_tracking": courier_tracking_count,
+            "stock_invoices": stock_invoices_count,
+            "verified_bills": verified_bills_count,
+            "portal": portal_days,
+            "booked_vehicles": booked_vehicles_count,
+            "coord_calls": coord_calls_count,
+            "courier_dispatch": courier_dispatch_count,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    NUMERIC_KEYS = (
+        "courier_tracking", "stock_invoices", "verified_bills",
+        "portal", "booked_vehicles", "coord_calls", "courier_dispatch",
+    )
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 3, row["transporter"],
+             font=_BODY_FONT if row["transporter"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 4, row["warehouse"],
+             font=_BODY_FONT if row["warehouse"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        for i, key in enumerate(NUMERIC_KEYS, start=5):
+            _put(ws, row_idx, i, row[key], font=num_font, fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        _put(ws, row_idx, 3, "", fill=_TOTAL_FILL)
+        _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
+        for i, key in enumerate(NUMERIC_KEYS, start=5):
+            _put(ws, row_idx, i,
+                 sum(r[key] for r in user_rows),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
     _apply_table_borders(
