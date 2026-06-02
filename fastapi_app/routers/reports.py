@@ -1095,32 +1095,33 @@ def _build_procurement_detail_sheet(ws, group, *, range_label: str):
     right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-    # Field key candidates per the report-field labels in the DB.
-    ENQUIRY_KEYS    = ("enquiriesForPricing", "enquiriesForPricingDone")
-    NEGOT_KEYS      = ("comparisonAndNegotiations", "comparisonNegotiations")
-    VENDOR_KEYS     = ("vendorOnboardingMeeting", "vendorOnboarding", "vendorMeeting")
-    PO_KEYS         = ("purchaseOrderProcess", "poProcess")
-    NOPA_KEYS       = ("paymentProcessNopa", "paymentProcess", "nopaProcess")
+    # Phrase-based scanner: finds every "<some header text> – N" or
+    # "<header text>: N" occurrence and lets a per-metric regex decide
+    # whether that header counts.  Header is captured up to 100 chars and
+    # cannot cross a newline, period, or semicolon — keeps each match scoped
+    # to one phrase.
+    HEADER_NUM_RE = re.compile(r"([^\n.;]{1,100}?)\s*[–\-:]\s*(\d+)\b", re.I)
 
-    # Explicit "keyword – N" patterns.  Look for the keyword followed by an
-    # en-dash / hyphen / colon and a number; sum every match in the cell.
-    def _build_count_re(*words):
-        word_alt = "|".join(words)
-        return re.compile(
-            rf"\b(?:{word_alt})\w*\s*[–\-:]\s*(\d+)",
-            re.I,
-        )
-
-    ENQUIRY_RE   = _build_count_re("inquir", "inquir(?:y|ies)\\s*sent", "rfq")
-    NEGOT_RE     = _build_count_re("negotiat", "comparison", "rate negotiat")
-    VENDOR_RE    = _build_count_re(
-        "meeting", "vendor coordination", "vendor onboarding",
-        "vendor registration", "new vendor",
+    # Per-metric keyword patterns.  Match against the header text — if the
+    # keyword appears anywhere in the phrase, the trailing N is counted.
+    ENQUIRY_KW = re.compile(r"\b(?:inquir(?:y|ies)|enquir(?:y|ies)|rfq)\b", re.I)
+    NEGOT_KW   = re.compile(r"\b(?:negotiat|comparison|rate\s+finalization)", re.I)
+    VENDOR_KW  = re.compile(
+        r"\b(?:meeting|vendor(?:\s+(?:coordination|registration|onboarding|"
+        r"added|registered|visit))?|new\s+vendor)\b",
+        re.I,
     )
-    PO_NUM_RE    = _build_count_re("po created", "po generated", "purchase order")
-    NOPA_NUM_RE  = _build_count_re("nopa created", "nopa processed", "nopa generated")
+    PO_KW   = re.compile(
+        r"\b(?:po|pos|purchase\s+order)s?\s+(?:created|generated|made|"
+        r"raised|prepared)\b",
+        re.I,
+    )
+    NOPA_KW = re.compile(
+        r"\b(?:nopa|nopas|nope)\s+(?:created|generated|processed|made|prepared)\b",
+        re.I,
+    )
 
-    # Distinct-ID fallback patterns (PO/OAPL/2627/0073, NOPA/OAPL/2526/0721/4)
+    # Distinct-ID patterns (PO/OAPL/2627/0073, NOPA/OAPL/2526/0721/4 etc.).
     PO_ID_RE   = re.compile(r"\bPO/[A-Z]+/\d+/\d+\b", re.I)
     NOPA_ID_RE = re.compile(r"\bNOPA/[A-Z]+/\d+/\d+(?:/\d+)?\b", re.I)
 
@@ -1129,19 +1130,19 @@ def _build_procurement_detail_sheet(ws, group, *, range_label: str):
         s = ("" if v is None else str(v)).strip()
         return s.lower() not in _NULL_TOKENS
 
-    def _sum_explicit(text, pattern):
+    def _sum_phrase_counts(text, keyword_pattern):
+        """Sum every '… <keyword phrase> – N' occurrence in the text."""
         if not text:
             return 0
         total = 0
-        for m in pattern.finditer(text):
-            try:
-                total += int(m.group(1))
-            except (ValueError, IndexError):
-                pass
+        for m in HEADER_NUM_RE.finditer(text):
+            header = m.group(1).strip()
+            if keyword_pattern.search(header):
+                try:
+                    total += int(m.group(2))
+                except ValueError:
+                    pass
         return total
-
-    def _count_days(text_list):
-        return sum(1 for t in text_list if _has_content(t))
 
     user_rows = []
     for _, user_reports in group["users"].items():
@@ -1154,35 +1155,30 @@ def _build_procurement_detail_sheet(ws, group, *, range_label: str):
                 or u.username
             )
 
-        # Pool text per field-group across all reports.
-        enquiry_texts, negot_texts, vendor_texts, po_texts, nopa_texts = [], [], [], [], []
+        # Pool EVERY field value across all reports.  Robust to unknown field
+        # keys — the scan runs on the whole employee corpus.
+        all_text_parts = []
         for r in sorted_reports:
             data = r.data or {}
-            for k in ENQUIRY_KEYS:
-                enquiry_texts.append(str(data.get(k, "") or ""))
-            for k in NEGOT_KEYS:
-                negot_texts.append(str(data.get(k, "") or ""))
-            for k in VENDOR_KEYS:
-                vendor_texts.append(str(data.get(k, "") or ""))
-            for k in PO_KEYS:
-                po_texts.append(str(data.get(k, "") or ""))
-            for k in NOPA_KEYS:
-                nopa_texts.append(str(data.get(k, "") or ""))
+            for k, v in data.items():
+                if k.startswith("__"):  # skip __leave__ markers
+                    continue
+                if v is None:
+                    continue
+                all_text_parts.append(str(v))
+        big_text = "\n".join(all_text_parts)
 
-        enq_text   = " ".join(enquiry_texts)
-        neg_text   = " ".join(negot_texts)
-        ven_text   = " ".join(vendor_texts)
-        po_text    = " ".join(po_texts)
-        nopa_text  = " ".join(nopa_texts)
-
-        # Each metric: take MAX of (explicit "—N" sum, fallback count).
-        # Fallbacks: distinct PO/NOPA IDs for those columns; days-with-content
-        # for the narrative columns.
-        enq_count = max(_sum_explicit(enq_text, ENQUIRY_RE), _count_days(enquiry_texts))
-        neg_count = max(_sum_explicit(neg_text, NEGOT_RE), _count_days(negot_texts))
-        ven_count = max(_sum_explicit(ven_text, VENDOR_RE), _count_days(vendor_texts))
-        po_count   = max(_sum_explicit(po_text,  PO_NUM_RE),   len(set(PO_ID_RE.findall(po_text))))
-        nopa_count = max(_sum_explicit(nopa_text, NOPA_NUM_RE), len(set(NOPA_ID_RE.findall(nopa_text))))
+        enq_count  = _sum_phrase_counts(big_text, ENQUIRY_KW)
+        neg_count  = _sum_phrase_counts(big_text, NEGOT_KW)
+        ven_count  = _sum_phrase_counts(big_text, VENDOR_KW)
+        po_count   = max(
+            _sum_phrase_counts(big_text, PO_KW),
+            len(set(PO_ID_RE.findall(big_text))),
+        )
+        nopa_count = max(
+            _sum_phrase_counts(big_text, NOPA_KW),
+            len(set(NOPA_ID_RE.findall(big_text))),
+        )
 
         user_rows.append({
             "name": full_name,
