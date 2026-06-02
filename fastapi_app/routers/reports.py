@@ -472,10 +472,11 @@ def export_xlsx(
 
     if inside_sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Inside Sales — Detail"))
-        # Drop the columns HR doesn't want on the Inside Sales tab.
+        # Drop only "Other Works" — Data Called Type / Mail Sent / WhatsApp Sent
+        # are kept on the Excel tab even though they're hidden on screen.
         _build_dept_detail_sheet(
             ws, inside_sales_group, range_label=range_label,
-            exclude_keys=("dataCalledType", "mailSent", "whatsappSent", "otherWorks"),
+            exclude_keys=("otherWorks",),
         )
 
     if service_group:
