@@ -1253,17 +1253,14 @@ def _build_design_detail_sheet(ws, group, *, range_label: str):
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
     # Known project / site names — extracted by case-insensitive match.
-    # If new ones appear in the data, add them here.
     PROJECT_NAMES = [
         "Muzaffarnagar", "Khaithwadi", "Kaithwadi", "Sihari", "Simbhalki",
-        "Lilasons", "Vales Function", "Tusara", "Mavikala", "Mavikalan",
-        "Kamala", "Titroda", "Padams", "Padom", "NTPC", "Ledure",
-        "G-Plast", "Vardhmaan", "Vardhman", "Faze", "Panipat", "Rooftop",
-        "Goa", "Sumati", "Holy Family", "Inroof", "Codal", "Bigwit",
-        "Suryagrid",
+        "Lilasons", "Lilason", "Vales Function", "Vales", "Tusara",
+        "Mavikala", "Mavikalan", "Kamala", "Titroda", "Padams", "Padom",
+        "NTPC", "Ledure", "G-Plast", "Vardhmaan", "Vardhman", "Faze",
+        "Panipat", "Rooftop", "Goa", "Sumati", "Holy Family", "Inroof",
+        "Codal", "Bigwit", "Suryagrid", "Priyanka", "Kapaseda",
     ]
-
-    # Capacity-anchored fallback: pulls the site word right after a MW/kWp.
     CAPACITY_SITE_RE = re.compile(
         r"\d+(?:\.\d+)?\s*(?:MWp|MW|kWp|kW)\b[\s\-]*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
     )
@@ -1273,9 +1270,21 @@ def _build_design_detail_sheet(ws, group, *, range_label: str):
         s = ("" if v is None else str(v)).strip()
         return s.lower() not in _NULL_TOKENS
 
-    # Field key candidates — design dept uses these labels per the PDF.
-    DESIGN_KEYS      = ("design",)
-    SITE_VISIT_KEYS  = ("siteSurveyVisit", "siteVisit", "siteSurveyAndVisit")
+    # Auto-discover field keys from the dept's report_fields by scanning
+    # labels — robust to differences in actual field-key spelling like
+    # `siteSurveyVisit` vs `siteVisit` vs `siteSurveyAndVisit`.
+    dept_fields = list(group["dept"].report_fields) if group["dept"] and group["dept"].report_fields else []
+    design_field_keys: list[str] = []
+    site_field_keys: list[str] = []
+    for f in dept_fields:
+        label_l = (f.get("label") or "").lower()
+        key_l = (f.get("key") or "").lower()
+        # Site-visit fields: label / key contains "visit" or "survey".
+        if "visit" in label_l or "survey" in label_l or "visit" in key_l or "survey" in key_l:
+            site_field_keys.append(f["key"])
+        # Design fields: label / key contains "design" (excluding "project management").
+        elif "design" in label_l or "design" in key_l or "drawing" in label_l or "layout" in label_l:
+            design_field_keys.append(f["key"])
 
     user_rows = []
     for _, user_reports in group["users"].items():
@@ -1293,31 +1302,38 @@ def _build_design_detail_sheet(ws, group, *, range_label: str):
         site_visit_days = 0
         for r in sorted_reports:
             data = r.data or {}
-            for k in DESIGN_KEYS:
-                v = data.get(k, "") or ""
+            # Pool design-field content + count distinct design entries.
+            for k in design_field_keys:
+                v = data.get(k) or ""
                 if _has_content(v):
                     design_text_pool.append(str(v))
-                    # Count distinct design entries (split on commas, periods,
-                    # semicolons, newlines and count non-empty fragments).
                     fragments = [
-                        f.strip() for f in re.split(r"[\n.;]+", str(v))
-                        if f.strip() and len(f.strip()) > 4
+                        s.strip() for s in re.split(r"[\n.;]+", str(v))
+                        if s.strip() and len(s.strip()) > 4
                     ]
                     designs_count += len(fragments)
-            if any(_has_content(data.get(k, "")) for k in SITE_VISIT_KEYS):
+            # Site-visit day: any of the site fields has real content.
+            if site_field_keys and any(_has_content(data.get(k, "")) for k in site_field_keys):
                 site_visit_days += 1
 
-        # Project name extraction: look up known names + capacity-anchored fallback.
-        big_design_text = " ".join(design_text_pool)
+        # Project name extraction: scan ALL field text (not just the design
+        # column) so projects mentioned in "Site Visit" / "Other Work" /
+        # "Project Management" still count.
+        all_text_parts = []
+        for r in sorted_reports:
+            for k, v in (r.data or {}).items():
+                if k.startswith("__") or v is None:
+                    continue
+                all_text_parts.append(str(v))
+        big_text = " ".join(all_text_parts)
+
         project_counts: dict[str, int] = {}
         for name in PROJECT_NAMES:
-            c = len(re.findall(rf"\b{re.escape(name)}\b", big_design_text, re.I))
+            c = len(re.findall(rf"\b{re.escape(name)}\b", big_text, re.I))
             if c > 0:
                 project_counts[name] = project_counts.get(name, 0) + c
-        # Capacity-anchored matches (catches names not in the list).
-        for m in CAPACITY_SITE_RE.finditer(big_design_text):
+        for m in CAPACITY_SITE_RE.finditer(big_text):
             cap = m.group(1).strip()
-            # Skip if already covered by an explicit name match.
             if any(cap.lower() in k.lower() or k.lower() in cap.lower() for k in project_counts):
                 continue
             project_counts[cap] = project_counts.get(cap, 0) + 1
