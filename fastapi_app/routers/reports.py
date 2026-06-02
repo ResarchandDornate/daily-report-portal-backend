@@ -437,6 +437,8 @@ def export_xlsx(
     inside_sales_group = None
     service_group = None
     project_group = None
+    marketing_group = None
+    production_group = None
     other_groups = []
     for group in by_dept.values():
         slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
@@ -448,6 +450,10 @@ def export_xlsx(
             service_group = group
         elif slug == "project":
             project_group = group
+        elif slug == "marketing":
+            marketing_group = group
+        elif slug == "production":
+            production_group = group
         else:
             other_groups.append(group)
 
@@ -470,6 +476,14 @@ def export_xlsx(
     if project_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Project — Detail"))
         _build_project_detail_sheet(ws, project_group, range_label=range_label)
+
+    if marketing_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Marketing — Detail"))
+        _build_marketing_detail_sheet(ws, marketing_group, range_label=range_label)
+
+    if production_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Production — Detail"))
+        _build_production_detail_sheet(ws, production_group, range_label=range_label)
 
     if other_groups:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
@@ -1011,6 +1025,270 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
         for i, key in enumerate(("site_visit", "inv_complaint", "parts_repl")):
             total = sum(r[key] for r in user_rows)
             _put(ws, row_idx, 3 + i, _disp(total),
+                 font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_production_detail_sheet(ws, group, *, range_label: str):
+    """Production department — 2 columns:
+      - Total Production: per-part breakdown like "M-purlin: 240,
+        Bridge clamps: 700, Walkway: 25" — parts named first, quantities
+        after, sorted by quantity descending.
+      - Other Works Summary: condensed prose from the "Other Works" field.
+    """
+    last_col = 4  # A margin + B Employee + C Total Production + D Other Works
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 60   # Wider — fits "part: qty, …" list
+    ws.column_dimensions["D"].width = 70
+
+    _merge_title(ws, 1, last_col, "Production — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = ["Employee", "Total Production", "Other Works Summary"]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    # Match "<number> nos/pcs/pieces/units" AND "nos/pcs/pieces/units <number>".
+    QTY_RE_AFTER = re.compile(
+        r"(\d+(?:,\d{3})*)\s*(?:nos\b|pieces?\b|pcs\b|units?\b)", re.I,
+    )
+    QTY_RE_BEFORE = re.compile(
+        r"(?:nos|pieces?|pcs|units?)\s*[-:]?\s*(\d+(?:,\d{3})*)", re.I,
+    )
+    # Words that get stripped from the start of each sentence when guessing
+    # the part name — they're noise, not part identifiers.
+    _PART_STOPWORDS = {
+        "project", "today", "production", "ready", "final", "complete",
+        "completed", "work", "the", "for", "and", "of", "with", "is",
+        "are", "ongoing", "ongoing.", "press", "machine", "die",
+        "raw", "material", "rm", "cutting", "banding", "assembly",
+        "unloading", "loading", "setup", "maintenance", "corner",
+        "from", "to", "into", "on", "by", "pear", "amparlin", "perching",
+        "ribiting", "carnor", "fitting", "fir", "ka", "for", "and",
+    }
+
+    def _normalize_part(name):
+        """Lowercase + collapse separators so 'M-purlin' / 'M purlin' /
+        'Mparlin' / 'M-Purline' all map to the same bucket."""
+        n = name.lower()
+        n = re.sub(r"[^a-z0-9]+", "", n)
+        # Common variants normalisation.
+        n = n.replace("amparlin", "mpurlin").replace("mparlin", "mpurlin")
+        n = n.replace("purline", "purlin")
+        return n
+
+    def extract_part_qty_pairs(text):
+        """Returns list of (display_name, qty) pulled from a production
+        log.  Looks at each clause/sentence, finds the first quantity in
+        it, and uses the preceding meaningful words as the part name."""
+        if not text:
+            return []
+        pairs = []
+        for sentence in re.split(r"[\n.;]+", str(text)):
+            s = sentence.strip()
+            if not s:
+                continue
+            s = re.sub(r"^\d{4}-\d{2}-\d{2}\s*[:\-]?\s*", "", s).strip()
+            s = re.sub(r"^\d+[.\)]\s*", "", s).strip()
+            if not s:
+                continue
+            m = QTY_RE_AFTER.search(s) or QTY_RE_BEFORE.search(s)
+            if not m:
+                continue
+            try:
+                qty = int(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            before = s[: m.start()].strip(" -:,")
+            words = re.findall(r"[A-Za-z][A-Za-z\-]*", before)
+            meaningful = [
+                w for w in words
+                if w.lower() not in _PART_STOPWORDS and len(w) >= 2
+            ]
+            if not meaningful:
+                continue
+            # First 1-2 meaningful words name the part.
+            part_name = " ".join(meaningful[:2])
+            pairs.append((part_name, qty))
+        return pairs
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        # Aggregate (part → total qty) across all reports.
+        per_part: dict[str, dict] = {}
+        for r in sorted_reports:
+            data = r.data or {}
+            for name, qty in extract_part_qty_pairs(data.get("todayProduction", "")):
+                norm = _normalize_part(name)
+                if not norm:
+                    continue
+                bucket = per_part.setdefault(norm, {"name": name, "qty": 0})
+                bucket["qty"] += qty
+        # Sort parts by quantity descending and format "Name: qty".
+        sorted_parts = sorted(per_part.values(), key=lambda p: -p["qty"])
+        production_text = ", ".join(
+            f"{p['name']}: {p['qty']:,}" for p in sorted_parts
+        ) if sorted_parts else _DASH
+        total_qty = sum(p["qty"] for p in sorted_parts)
+
+        other_text_pool = []
+        for r in sorted_reports:
+            ow = ((r.data or {}).get("otherWorks") or "").strip()
+            if ow and ow.lower() not in ("na", "n/a", "n.a.", "-", "—", "nil", "none", "on leave"):
+                other_text_pool.append(ow)
+        other_summary = _condense_summary("\n".join(other_text_pool), max_chars=180)
+
+        user_rows.append({
+            "name": full_name,
+            "production_text": production_text,
+            "total_qty": total_qty,
+            "other_summary": other_summary or _DASH,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 3, row["production_text"],
+             font=_BODY_FONT if row["production_text"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 4, row["other_summary"],
+             font=_BODY_FONT if row["other_summary"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        _put(ws, row_idx, 3,
+             f"{sum(r['total_qty'] for r in user_rows):,}",
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+        _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
+
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=row_idx if user_rows else row_idx - 1,
+        first_col=2, last_col=last_col,
+    )
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_marketing_detail_sheet(ws, group, *, range_label: str):
+    """Marketing department — 5 aggregated counter columns.  Each cell
+    counts the number of DAYS the employee logged meaningful content in
+    that activity area (empty / "N/A" / "Na" / "-" don't count).
+    """
+    last_col = 7  # A margin + B Employee + 5 counters
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 24
+    for i, w in enumerate([22, 22, 18, 12, 16], start=3):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    _merge_title(ws, 1, last_col, "Marketing — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Employee", "Videos Created / Edited",
+        "PPT / PDF / Brochures", "Content Writing", "SEO", "Reporting",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 28
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    VIDEO_KEYS    = ("videoEditing",)
+    PPTPDF_KEYS   = ("brochurePptPdfEdits", "creatives")
+    CONTENT_KEYS  = ("contentWriting",)
+    SEO_KEYS      = ("seo",)
+    REPORT_KEYS   = ("reporting",)
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        def count_days(keys):
+            return sum(
+                1 for r in sorted_reports
+                if any(_has_content((r.data or {}).get(k, "")) for k in keys)
+            )
+
+        user_rows.append({
+            "name": full_name,
+            "video": count_days(VIDEO_KEYS),
+            "pptpdf": count_days(PPTPDF_KEYS),
+            "content": count_days(CONTENT_KEYS),
+            "seo": count_days(SEO_KEYS),
+            "report": count_days(REPORT_KEYS),
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        for i, key in enumerate(("video", "pptpdf", "content", "seo", "report")):
+            _put(ws, row_idx, 3 + i, row[key],
+                 font=num_font, fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        for i, key in enumerate(("video", "pptpdf", "content", "seo", "report")):
+            _put(ws, row_idx, 3 + i,
+                 sum(r[key] for r in user_rows),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
     _apply_table_borders(
