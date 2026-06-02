@@ -583,6 +583,99 @@ def _apply_table_borders(ws, *, header_row: int, last_row: int, first_col: int, 
             ws.cell(row=r, column=c).border = _CELL_BORDER
 
 
+def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str | None = None) -> int:
+    """Append a 'Daily Reports' block two rows below the summary table.
+
+    Columns are: Date | Employee | one column per report_field of the
+    department.  Each row is a single submitted daily report (raw values,
+    no aggregation).  Returns the last row used so callers can chain.
+    """
+    d = group["dept"]
+    fields = list(d.report_fields) if d and d.report_fields else []
+    n_fields = len(fields)
+    last_col = 3 + n_fields  # B Date, C Employee, D.. fields
+
+    def _emp_name(u):
+        if not u:
+            return ""
+        return (
+            f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+            or (u.username or "")
+        )
+
+    all_reports = []
+    for _, user_reports in group["users"].items():
+        all_reports.extend(user_reports)
+    all_reports.sort(key=lambda r: (
+        -(r.date.toordinal() if r.date else 0),
+        _emp_name(r.user).lower(),
+    ))
+
+    def _widen(col_letter, min_width):
+        cur = ws.column_dimensions[col_letter].width or 0
+        if cur < min_width:
+            ws.column_dimensions[col_letter].width = min_width
+    _widen("B", 14)
+    _widen("C", 22)
+    for i in range(n_fields):
+        _widen(get_column_letter(4 + i), 24)
+
+    title_row = start_row + 2
+    section_title = dept_label or "Daily Reports"
+    section_title = f"{section_title} ({len(all_reports)} report{'' if len(all_reports) == 1 else 's'})"
+    _merge_title(ws, title_row, last_col, section_title, _TITLE_FONT)
+    ws.row_dimensions[title_row].height = 24
+
+    header_row = title_row + 2
+    _put(ws, header_row, 2, "Date",
+         font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    _put(ws, header_row, 3, "Employee",
+         font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    for i, f in enumerate(fields):
+        label = f.get("label") or f.get("key") or ""
+        _put(ws, header_row, 4 + i, label,
+             font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[header_row].height = 26
+
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    num_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+    row_idx = header_row + 1
+    if not all_reports:
+        _put(ws, row_idx, 2, "No reports in range.",
+             font=_MUTED_FONT, fill=_ROW_FILL, align=body_left)
+        ws.merge_cells(
+            start_row=row_idx, start_column=2,
+            end_row=row_idx, end_column=last_col,
+        )
+        last_row = row_idx
+    else:
+        for r in all_reports:
+            date_str = r.date.strftime("%d %b %Y") if r.date else ""
+            _put(ws, row_idx, 2, date_str,
+                 font=_BODY_FONT, fill=_ROW_FILL, align=num_align)
+            _put(ws, row_idx, 3, _emp_name(r.user),
+                 font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+            for i, f in enumerate(fields):
+                key = f.get("key") or ""
+                v = (r.data or {}).get(key, "")
+                s = "" if v is None else str(v).strip()
+                if not s:
+                    _put(ws, row_idx, 4 + i, _DASH,
+                         font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
+                else:
+                    _put(ws, row_idx, 4 + i, s,
+                         font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
+            row_idx += 1
+        last_row = row_idx - 1
+
+    _apply_table_borders(
+        ws, header_row=header_row,
+        last_row=last_row, first_col=2, last_col=last_col,
+    )
+    return last_row
+
+
 def _set_print_landscape_fit(ws):
     """Configure the sheet so Excel's print/PDF lands on a single landscape
     page wide and lets rows flow to as many pages as needed."""
@@ -938,11 +1031,13 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                 _put(ws, row_idx, 3 + i, _DASH,
                      font=_MUTED_FONT, fill=_TOTAL_FILL, align=_CENTER)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1048,11 +1143,13 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
             _put(ws, row_idx, 3 + i, _disp(total),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1206,11 +1303,13 @@ def _build_procurement_detail_sheet(ws, group, *, range_label: str):
                  sum(r[key] for r in user_rows),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1385,11 +1484,13 @@ def _build_design_detail_sheet(ws, group, *, range_label: str):
              sum(r["site_visits"] for r in user_rows),
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1570,11 +1671,13 @@ def _build_logistics_detail_sheet(ws, group, *, range_label: str):
                  sum(r[key] for r in user_rows),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1737,11 +1840,13 @@ def _build_production_detail_sheet(ws, group, *, range_label: str):
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
         _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1834,11 +1939,13 @@ def _build_marketing_detail_sheet(ws, group, *, range_label: str):
                  sum(r[key] for r in user_rows),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -1934,11 +2041,13 @@ def _build_project_detail_sheet(ws, group, *, range_label: str):
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
         _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
 
+    summary_last_row = row_idx if user_rows else row_idx - 1
     _apply_table_borders(
         ws, header_row=4,
-        last_row=row_idx if user_rows else row_idx - 1,
+        last_row=summary_last_row,
         first_col=2, last_col=last_col,
     )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
     ws.freeze_panes = "C5"
     _set_print_landscape_fit(ws)
 
@@ -2010,8 +2119,20 @@ def _build_combined_summary_sheet(ws, other_groups, *, range_label: str, today_l
                  fill=_ROW_FILL, align=_LEFT_TOP_WRAP)
             row_idx += 1
 
-    _apply_table_borders(ws, header_row=4, last_row=row_idx - 1,
+    summary_last_row = row_idx - 1
+    _apply_table_borders(ws, header_row=4, last_row=summary_last_row,
                          first_col=2, last_col=last_col)
+
+    # One "Daily Reports" block per department, stacked beneath the summary.
+    cursor = summary_last_row
+    for group in sorted_groups:
+        d = group["dept"]
+        dept_name = d.name if d else "No Department"
+        cursor = _append_daily_reports_section(
+            ws, group, start_row=cursor,
+            dept_label=f"{dept_name} — Daily Reports",
+        )
+
     ws.freeze_panes = "D5"
     _set_print_landscape_fit(ws)
 
