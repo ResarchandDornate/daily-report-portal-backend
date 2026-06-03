@@ -607,9 +607,11 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
     all_reports = []
     for _, user_reports in group["users"].items():
         all_reports.extend(user_reports)
+    # Group by employee (alphabetical), newest first within each block —
+    # so all of one person's reports appear together instead of mixed by date.
     all_reports.sort(key=lambda r: (
-        -(r.date.toordinal() if r.date else 0),
         _emp_name(r.user).lower(),
+        -(r.date.toordinal() if r.date else 0),
     ))
 
     def _widen(col_letter, min_width):
@@ -651,12 +653,34 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
         )
         last_row = row_idx
     else:
+        # Show the employee name only on the first row of each block, and
+        # merge that name cell down across the block so the grouping reads
+        # at a glance.  Records the start row for every block so we can
+        # merge after the rows are written.
+        prev_name = None
+        block_start = None
+        block_name = None
+        block_ranges: list[tuple[str, int, int]] = []
+
         for r in all_reports:
+            name = _emp_name(r.user)
             date_str = r.date.strftime("%d %b %Y") if r.date else ""
             _put(ws, row_idx, 2, date_str,
                  font=_BODY_FONT, fill=_ROW_FILL, align=num_align)
-            _put(ws, row_idx, 3, _emp_name(r.user),
-                 font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+            if name != prev_name:
+                # New employee block — close the previous one, start fresh.
+                if block_start is not None:
+                    block_ranges.append((block_name, block_start, row_idx - 1))
+                _put(ws, row_idx, 3, name,
+                     font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+                block_start = row_idx
+                block_name = name
+                prev_name = name
+            else:
+                # Continuation row — leave the name cell empty so the merge
+                # span shows the name once at the top.
+                _put(ws, row_idx, 3, "",
+                     font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
             for i, f in enumerate(fields):
                 key = f.get("key") or ""
                 v = (r.data or {}).get(key, "")
@@ -668,7 +692,22 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
                     _put(ws, row_idx, 4 + i, s,
                          font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
             row_idx += 1
+        # Close the final block.
+        if block_start is not None:
+            block_ranges.append((block_name, block_start, row_idx - 1))
         last_row = row_idx - 1
+
+        # Merge each employee's name cell vertically across their block.
+        for _bname, start_r, end_r in block_ranges:
+            if end_r > start_r:
+                ws.merge_cells(
+                    start_row=start_r, start_column=3,
+                    end_row=end_r, end_column=3,
+                )
+                top_cell = ws.cell(row=start_r, column=3)
+                top_cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True,
+                )
 
     _apply_table_borders(
         ws, header_row=header_row,
