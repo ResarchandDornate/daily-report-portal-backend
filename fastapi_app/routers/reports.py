@@ -291,12 +291,19 @@ def _compact_join(values, *, max_chars: int = 120) -> str:
 
 
 def _format_revenue(n):
-    """Render a revenue value as `₹X,XXX,XXX` (no decimal if whole)."""
+    """Render a revenue value in lakhs — `₹X.XX L`.
+
+    1 lakh = 100,000 rupees.  Two decimals are always shown for sub-lakh
+    precision, with thousands separators on the lakh portion.
+    """
     if n is None:
         return _DASH
-    if isinstance(n, float) and not n.is_integer():
-        return f"₹{n:,.2f}"
-    return f"₹{int(n):,}"
+    try:
+        amount = float(n)
+    except (TypeError, ValueError):
+        return _DASH
+    lakhs = amount / 100000.0
+    return f"₹{lakhs:,.2f} L"
 
 
 def _summarise_user_reports(reports):
@@ -434,6 +441,8 @@ def export_xlsx(
     #   3. Detailed Summary      (all OTHER departments, one row per
     #                             employee with consolidated Key Activities)
     sales_group = None
+    sales_head_group = None
+    sales_service_group = None
     inside_sales_group = None
     service_group = None
     project_group = None
@@ -442,11 +451,28 @@ def export_xlsx(
     logistics_group = None
     design_group = None
     procurement_group = None
+    reception_group = None
     other_groups = []
     for group in by_dept.values():
         slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
+        name = (getattr(group["dept"], "name", "") if group["dept"] else "") or ""
+        slug_l = (slug or "").lower()
+        name_l = name.lower()
+        is_sales_head = (
+            slug_l in ("saleshead", "sales_head", "sales-head")
+            or ("sales" in name_l and "head" in name_l)
+        )
+        is_reception = (
+            slug_l in ("reception", "frontoffice", "front_office", "front-office")
+            or "reception" in name_l
+            or "front office" in name_l
+        )
         if slug == "sales":
             sales_group = group
+        elif is_sales_head:
+            sales_head_group = group
+        elif slug == "salesService" or "sales service" in name_l:
+            sales_service_group = group
         elif slug == "insideSales":
             inside_sales_group = group
         elif slug == "service":
@@ -463,12 +489,24 @@ def export_xlsx(
             design_group = group
         elif slug == "procurement":
             procurement_group = group
+        elif is_reception:
+            reception_group = group
         else:
             other_groups.append(group)
 
     if sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales — Detail"))
         _build_dept_detail_sheet(ws, sales_group, range_label=range_label)
+
+    if sales_head_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales Head — Detail"))
+        _build_dept_detail_sheet(ws, sales_head_group, range_label=range_label)
+
+    if sales_service_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales Service — Detail"))
+        _build_sales_service_detail_sheet(
+            ws, sales_service_group, range_label=range_label,
+        )
 
     if inside_sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Inside Sales — Detail"))
@@ -506,6 +544,10 @@ def export_xlsx(
     if procurement_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Procurement — Detail"))
         _build_procurement_detail_sheet(ws, procurement_group, range_label=range_label)
+
+    if reception_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Reception — Detail"))
+        _build_dept_detail_sheet(ws, reception_group, range_label=range_label)
 
     if other_groups:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
@@ -1085,19 +1127,304 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
     _set_print_landscape_fit(ws)
 
 
+def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
+    """Sales Service department — 5 aggregated columns + subtotal.
+
+    Counts are anchored to the **actual daily reports** the way HR reads
+    them: each numeric column equals the number of distinct days the
+    employee logged real content for that metric (i.e. one report submitted
+    on date X that mentions a complaint = 1 complaint).  Names / sites /
+    projects / clients are extracted **only from that field's text**, so
+    nothing is invented from unrelated columns.  Field detection is
+    label-based (case-insensitive), making it robust to whatever the
+    actual DB field keys are.
+    """
+    last_col = 7  # A margin + B Employee + 4 data cols + Subtotal
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 22
+    widths = [48, 48, 48, 18, 14]
+    for i, w in enumerate(widths, start=3):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    _merge_title(ws, 1, last_col, "Sales Service — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Employee",
+        "Complaints (with sites)",
+        "Kusum Docs Submitted (with project)",
+        "Clients for Loan (with name)",
+        "Calls for Kusum Docs",
+        "Subtotal",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 32
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
+
+    # ---- Auto-detect which report_field holds which metric ----
+    # We inspect each field's label + key (case-insensitive).  A field
+    # contributes to a metric only if its OWN label / key clearly matches
+    # that metric — no "spillover" from one column to another.  This is the
+    # key to keeping the counts accurate.
+    dept_fields = list(group["dept"].report_fields) if group["dept"] and group["dept"].report_fields else []
+
+    def _match(field, *patterns):
+        text = ((field.get("label") or "") + " " + (field.get("key") or "")).lower()
+        return all(re.search(p, text) for p in patterns)
+
+    complaint_keys: list[str] = []
+    kusum_doc_keys: list[str] = []
+    loan_keys: list[str] = []
+    kusum_call_keys: list[str] = []
+    for f in dept_fields:
+        # Calls for Kusum Docs: requires BOTH 'kusum' and 'call' tokens.
+        if _match(f, r"kusum", r"call"):
+            kusum_call_keys.append(f["key"])
+            continue
+        # Kusum Docs Submitted: 'kusum' or 'doc submit' or 'document submit'.
+        if (
+            _match(f, r"kusum") and _match(f, r"doc|submit")
+            or _match(f, r"document", r"submit")
+            or _match(f, r"doc", r"submit")
+        ):
+            kusum_doc_keys.append(f["key"])
+            continue
+        # Loan / finance.
+        if _match(f, r"\bloan\b") or _match(f, r"\bfinance\b") or _match(f, r"\bemi\b") or _match(f, r"\bfunding\b"):
+            loan_keys.append(f["key"])
+            continue
+        # Complaints / issues / tickets.
+        if _match(f, r"complain|complaint|issue|ticket"):
+            complaint_keys.append(f["key"])
+
+    # Generic phrase scanner — used ONLY for the Calls counter (a pure
+    # number column).  Names / sites are NOT extracted via this.
+    HEADER_NUM_RE = re.compile(r"([^\n.;]{1,120}?)\s*[–\-:]\s*(\d+)\b", re.I)
+
+    # Site/city names — used only to label complaints with where they came
+    # from.  The total complaint COUNT is `days_with_content(complaint_keys)`
+    # so even if we mis-identify a site, the count stays accurate.
+    SITE_NAMES = [
+        "Noida", "Delhi", "Gurugram", "Gurgaon", "Ghaziabad", "Faridabad",
+        "Mumbai", "Pune", "Nagpur", "Nashik", "Mandsaur", "Indore",
+        "Lucknow", "Agra", "Kanpur", "Varanasi", "Moradabad", "Bulandshahr",
+        "Meerut", "Mathura", "Aligarh", "Bareilly", "Jaipur", "Jodhpur",
+        "Udaipur", "Kota", "Ajmer", "Bikaner", "Ahmedabad", "Surat",
+        "Vadodara", "Rajkot", "Gandhinagar", "Nadiad", "Chennai",
+        "Coimbatore", "Bengaluru", "Bangalore", "Hyderabad", "Kolkata",
+        "Chandigarh", "Ludhiana", "Amritsar", "Patiala", "Mohali",
+        "Kaithal", "Karnal", "Hisar", "Rohtak", "Panipat", "Sonipat",
+        "Bhopal", "Gwalior", "Jabalpur", "Patna", "Ranchi", "Goa",
+        "Mavikala", "Sihari", "Simbhalki", "Lilason", "Kapaseda",
+    ]
+    CAPACITY_SITE_RE = re.compile(
+        r"\d+(?:\.\d+)?\s*(?:MWp|MW|kWp|kW)\b[\s\-]*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
+    )
+    NAMEY_RE = re.compile(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,2})\b")
+    NAME_BLACKLIST = {
+        "Note", "Status", "Date", "Loan", "Kusum", "Doc", "Docs", "Submit",
+        "Submitted", "Bank", "Client", "Clients", "Customer", "Customers",
+        "Project", "Projects", "Site", "Sites", "Solar", "Inverter", "Module",
+        "Total", "Subtotal", "Call", "Calls", "Called", "Today", "Tomorrow",
+        "Yesterday", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+        "Sunday", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+        "Sep", "Oct", "Nov", "Dec", "Done", "Pending", "Completed", "Yes",
+        "No", "Mail", "Email", "Phone", "Address",
+    }
+
+    def _scan_sites(text):
+        out: dict[str, int] = {}
+        if not text:
+            return out
+        for name in SITE_NAMES:
+            c = len(re.findall(rf"\b{re.escape(name)}\b", text, re.I))
+            if c > 0:
+                out[name] = out.get(name, 0) + c
+        for m in CAPACITY_SITE_RE.finditer(text):
+            cap = m.group(1).strip()
+            if any(cap.lower() in n.lower() or n.lower() in cap.lower() for n in out):
+                continue
+            out[cap] = out.get(cap, 0) + 1
+        return out
+
+    def _scan_names(text):
+        """Title-case multi-word names from `text`, blacklist-filtered."""
+        out: dict[str, int] = {}
+        if not text:
+            return out
+        for m in NAMEY_RE.finditer(text):
+            name = m.group(1).strip()
+            first = name.split()[0]
+            if first in NAME_BLACKLIST:
+                continue
+            # Require at least two words to qualify as a person / project name.
+            if " " not in name:
+                continue
+            out[name] = out.get(name, 0) + 1
+        return out
+
+    def _fmt_with_count(label_counts, day_count, top=6):
+        """Render '<name>: <count>, …' followed by ' (Total: N)' where N is
+        the number of days the underlying field had real content — that's
+        the authoritative count HR will check against the daily reports."""
+        if day_count <= 0 and not label_counts:
+            return _DASH
+        if label_counts:
+            items = sorted(label_counts.items(), key=lambda x: -x[1])[:top]
+            names = ", ".join(f"{n}: {c}" for n, c in items)
+            return f"{names} (Total: {day_count})"
+        return f"Total: {day_count}"
+
+    def _sum_phrase_counts(text, keyword_pattern):
+        if not text:
+            return 0
+        total = 0
+        for m in HEADER_NUM_RE.finditer(text):
+            header = m.group(1).strip()
+            if keyword_pattern.search(header):
+                try:
+                    total += int(m.group(2))
+                except ValueError:
+                    pass
+        return total
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        # Count days where the specific field has real content.  This is the
+        # number HR can verify by looking at the daily reports table below.
+        def days_with(keys):
+            if not keys:
+                return 0
+            c = 0
+            for r in sorted_reports:
+                data = r.data or {}
+                if any(_has_content(data.get(k, "")) for k in keys):
+                    c += 1
+            return c
+
+        def pooled(keys):
+            parts = []
+            for r in sorted_reports:
+                data = r.data or {}
+                for k in keys:
+                    v = data.get(k)
+                    if v is not None and _has_content(v):
+                        parts.append(str(v))
+            return "\n".join(parts)
+
+        complaint_days = days_with(complaint_keys)
+        kusum_days = days_with(kusum_doc_keys)
+        loan_days = days_with(loan_keys)
+        kusum_call_days = days_with(kusum_call_keys)
+
+        # Extract names ONLY from the relevant field's pooled text.
+        complaint_sites = _scan_sites(pooled(complaint_keys))
+        kusum_projects = _scan_names(pooled(kusum_doc_keys))
+        loan_clients = _scan_names(pooled(loan_keys))
+
+        # For the Calls column, prefer an explicit "Calls – N" phrase total
+        # when one is present in that field; otherwise fall back to days.
+        kusum_call_phrase_total = _sum_phrase_counts(
+            pooled(kusum_call_keys),
+            re.compile(r"\bcall", re.I),
+        )
+        kusum_calls = max(kusum_call_phrase_total, kusum_call_days)
+
+        row_subtotal = (
+            complaint_days + kusum_days + loan_days + kusum_calls
+        )
+
+        user_rows.append({
+            "name": full_name,
+            "complaints_text": _fmt_with_count(complaint_sites, complaint_days),
+            "kusum_text": _fmt_with_count(kusum_projects, kusum_days),
+            "loans_text": _fmt_with_count(loan_clients, loan_days),
+            "kusum_calls": kusum_calls,
+            "subtotal": row_subtotal,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        for col, key in [
+            (3, "complaints_text"), (4, "kusum_text"), (5, "loans_text"),
+        ]:
+            txt = row[key]
+            _put(ws, row_idx, col, txt,
+                 font=_BODY_FONT if txt != _DASH else _MUTED_FONT,
+                 fill=_ROW_FILL,
+                 align=body_left if txt != _DASH else right_align)
+        _put(ws, row_idx, 6, row["kusum_calls"],
+             font=num_font, fill=_ROW_FILL, align=right_align)
+        _put(ws, row_idx, 7, row["subtotal"],
+             font=Font(bold=True, size=10, color="1A1A1A"),
+             fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        _put(ws, row_idx, 3, "", fill=_TOTAL_FILL)
+        _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
+        _put(ws, row_idx, 5, "", fill=_TOTAL_FILL)
+        _put(ws, row_idx, 6, sum(r["kusum_calls"] for r in user_rows),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+        _put(ws, row_idx, 7, sum(r["subtotal"] for r in user_rows),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    summary_last_row = row_idx if user_rows else row_idx - 1
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=summary_last_row,
+        first_col=2, last_col=last_col,
+    )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
 def _build_service_detail_sheet(ws, group, *, range_label: str):
     """Service department — 3 aggregated columns instead of one per
     report_field.  Combines the underlying daily fields so HR sees totals
     for site visits, inverter complaints, and part replacements per
     employee.
     """
-    last_col = 5  # A margin + B Employee + C Site Visit + D Inv Complaint + E Parts Repl
+    last_col = 6  # A margin + B Employee + C Sites Visited + D Total Site Visit + E Inv Complaint + F Parts Repl
 
     ws.column_dimensions["A"].width = 3
     ws.column_dimensions["B"].width = 24
-    ws.column_dimensions["C"].width = 18
-    ws.column_dimensions["D"].width = 26
+    ws.column_dimensions["C"].width = 55   # Sites Visited (names + counts)
+    ws.column_dimensions["D"].width = 16   # Total Site Visit
     ws.column_dimensions["E"].width = 26
+    ws.column_dimensions["F"].width = 26
 
     _merge_title(ws, 1, last_col, "Service — summary table", _TITLE_FONT)
     ws.row_dimensions[1].height = 26
@@ -1110,7 +1437,10 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
     )
     _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
 
-    headers = ["Employee", "Total Site Visit", "Total Inverter Complaint", "Inverter Parts Replacement"]
+    headers = [
+        "Employee", "Sites Visited (with count)", "Total Site Visit",
+        "Total Inverter Complaint", "Inverter Parts Replacement",
+    ]
     for i, h in enumerate(headers, start=2):
         _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
     ws.row_dimensions[4].height = 28
@@ -1123,6 +1453,8 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
     # Each cell shows the COUNT OF DAYS the employee logged meaningful
     # content in that area (a day with "N/A" / "Na" / "-" does NOT count).
     #
+    #   Sites Visited            = site names + visit counts parsed out of the
+    #                              site-visit text (regardless of key spelling)
     #   Total Site Visit         = days where Solar Install OR Inverter
     #                              Complaint site visit field has real content
     #   Total Inverter Complaint = days where Complaint site visit OR
@@ -1138,6 +1470,42 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
     def _has_content(v):
         s = ("" if v is None else str(v)).strip()
         return s.lower() not in _NULL_TOKENS
+
+    # Auto-discover site-visit field keys from the dept schema so we're not
+    # dependent on the exact spelling of `solarInstallationSiteVisit` etc.
+    dept_fields = list(group["dept"].report_fields) if group["dept"] and group["dept"].report_fields else []
+    auto_site_keys: list[str] = []
+    for f in dept_fields:
+        label_l = (f.get("label") or "").lower()
+        key_l = (f.get("key") or "").lower()
+        if "visit" in label_l or "visit" in key_l or "site" in label_l or "site" in key_l:
+            auto_site_keys.append(f["key"])
+    if auto_site_keys:
+        SITE_VISIT_KEYS = tuple(dict.fromkeys(list(SITE_VISIT_KEYS) + auto_site_keys))
+
+    # Known Indian site / city names — case-insensitive whole-word match.
+    SITE_NAMES = [
+        "Noida", "Delhi", "Gurugram", "Gurgaon", "Ghaziabad", "Faridabad",
+        "Mumbai", "Pune", "Nagpur", "Nashik", "Mandsaur", "Indore",
+        "Lucknow", "Agra", "Kanpur", "Varanasi", "Allahabad", "Moradabad",
+        "Bulandshahr", "Meerut", "Mathura", "Aligarh", "Bareilly",
+        "Jaipur", "Jodhpur", "Udaipur", "Kota", "Ajmer", "Bikaner",
+        "Ahmedabad", "Surat", "Vadodara", "Rajkot", "Gandhinagar", "Nadiad",
+        "Chennai", "Coimbatore", "Madurai", "Tirupur",
+        "Bengaluru", "Bangalore", "Mysuru", "Mysore", "Hubli",
+        "Hyderabad", "Vijayawada", "Vizag", "Visakhapatnam",
+        "Kolkata", "Howrah", "Durgapur",
+        "Chandigarh", "Ludhiana", "Amritsar", "Patiala", "Mohali",
+        "Kaithal", "Karnal", "Hisar", "Rohtak", "Panipat", "Sonipat",
+        "Bhopal", "Gwalior", "Jabalpur", "Ujjain", "Sagar",
+        "Patna", "Ranchi", "Jamshedpur",
+        "Goa", "Panaji", "Mangaluru", "Mangalore",
+        "Sihari", "Simbhalki", "Lilasons", "Lilason", "Mavikala",
+        "Kamala", "Titroda", "Padams", "Tusara", "Kapaseda", "Priyanka",
+    ]
+    CAPACITY_SITE_RE = re.compile(
+        r"\d+(?:\.\d+)?\s*(?:MWp|MW|kWp|kW)\b[\s\-]*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
+    )
 
     user_rows = []
     for _, user_reports in group["users"].items():
@@ -1160,8 +1528,33 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
                     total += 1
             return total
 
+        # Pool every site-visit field's text for this employee.
+        site_text_parts = []
+        for r in sorted_reports:
+            data = r.data or {}
+            for k in SITE_VISIT_KEYS:
+                v = data.get(k)
+                if v and _has_content(v):
+                    site_text_parts.append(str(v))
+        site_blob = " ".join(site_text_parts)
+
+        site_counts: dict[str, int] = {}
+        for name in SITE_NAMES:
+            c = len(re.findall(rf"\b{re.escape(name)}\b", site_blob, re.I))
+            if c > 0:
+                site_counts[name] = site_counts.get(name, 0) + c
+        for m in CAPACITY_SITE_RE.finditer(site_blob):
+            cap = m.group(1).strip()
+            if any(cap.lower() in n.lower() or n.lower() in cap.lower() for n in site_counts):
+                continue
+            site_counts[cap] = site_counts.get(cap, 0) + 1
+
+        sorted_sites = sorted(site_counts.items(), key=lambda x: -x[1])[:8]
+        sites_text = ", ".join(f"{n}: {c}" for n, c in sorted_sites) or _DASH
+
         user_rows.append({
             "name": full_name,
+            "sites_text": sites_text,
             "site_visit": count_days(SITE_VISIT_KEYS),
             "inv_complaint": count_days(INV_COMPLAINT_KEYS),
             "parts_repl": count_days(PARTS_REPL_KEYS),
@@ -1174,16 +1567,21 @@ def _build_service_detail_sheet(ws, group, *, range_label: str):
     row_idx = 5
     for row in user_rows:
         _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 3, row["sites_text"],
+             font=_BODY_FONT if row["sites_text"] != _DASH else _MUTED_FONT,
+             fill=_ROW_FILL,
+             align=body_left if row["sites_text"] != _DASH else right_align)
         for i, key in enumerate(("site_visit", "inv_complaint", "parts_repl")):
-            _put(ws, row_idx, 3 + i, _disp(row[key]),
+            _put(ws, row_idx, 4 + i, _disp(row[key]),
                  font=num_font, fill=_ROW_FILL, align=right_align)
         row_idx += 1
 
     if user_rows:
         _put(ws, row_idx, 2, "Total", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        _put(ws, row_idx, 3, "", font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
         for i, key in enumerate(("site_visit", "inv_complaint", "parts_repl")):
             total = sum(r[key] for r in user_rows)
-            _put(ws, row_idx, 3 + i, _disp(total),
+            _put(ws, row_idx, 4 + i, _disp(total),
                  font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
     summary_last_row = row_idx if user_rows else row_idx - 1
@@ -1582,20 +1980,62 @@ def _build_logistics_detail_sheet(ws, group, *, range_label: str):
     right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-    # Known names — looked up case-insensitively in the free-text logs.
+    # Known names — looked up case-insensitively in the pooled free-text logs.
     TRANSPORTERS = [
         "Trackon", "Allcargo", "All Cargo", "Delhivery", "Truxcargo",
-        "Trux Cargo", "WheelsEye", "Wheels Eye", "Rivigo", "FEDEX",
-        "Aryan", "TCI", "Porter", "Bike Porter",
+        "Trux Cargo", "WheelsEye", "Wheels Eye", "Rivigo", "FEDEX", "FedEx",
+        "Aryan", "TCI", "Porter", "Bike Porter", "Blue Dart", "DTDC",
+        "Safexpress", "Gati", "VRL", "Mahindra", "ECom Express", "DHL",
+        "Shree Maruti", "Shree Anjani", "VTrans", "V-Trans", "VXpress",
+        "DRS", "DRS Group", "Spoton", "Maruti Courier",
     ]
     WAREHOUSES = [
         "AQDAS", "Logiwiz", "Rama", "MJ Infa", "Yusen", "Chennai",
         "Pune", "Ludhiana", "Nhava Sheva", "Maharashtra", "Okhla",
-        "Bikaner", "Delhi warehouse",
+        "Bikaner", "Delhi warehouse", "Sonipat", "Bhiwandi", "Gurugram",
+        "Noida", "Faridabad", "Mumbai warehouse", "Bangalore warehouse",
+        "Hyderabad warehouse",
     ]
 
-    # Invoice numbers look like OS-MAY26-040-DL, DC-MAY26-0009-DL, OS-APR26-072-DL
-    INVOICE_RE = re.compile(r"\b(?:OS|DC)-[A-Z]{3}\d{2}-[\dA-Z\-]+", re.I)
+    # Invoice / waybill IDs across formats: OS-MAY26-040-DL, DC-MAY26-0009-DL,
+    # GR-..., LR-..., AWB.... — be permissive on the prefix and trailing parts.
+    INVOICE_RE = re.compile(
+        r"\b(?:OS|DC|GR|LR|AWB)[-/][A-Z0-9]+(?:[-/][A-Z0-9]+)+\b",
+        re.I,
+    )
+
+    # Generic phrase scanner — "<header containing keyword>: N" or "... – N".
+    HEADER_NUM_RE = re.compile(r"([^\n.;]{1,120}?)\s*[–\-:]\s*(\d+)\b", re.I)
+
+    # Per-metric keyword patterns (matched against the phrase header).
+    VERIFIED_KW = re.compile(r"\b(?:verif|bill\s+verif|verified\s+bill)", re.I)
+    BOOKED_KW = re.compile(
+        r"\b(?:book(?:ed|ing)?\s+vehicle|vehicle\s+book|truck\s+book|"
+        r"vehicle\s+arranged|vehicle\s+placed)",
+        re.I,
+    )
+    CALL_KW = re.compile(
+        r"\b(?:coordination\s+call|call(?:ed|s)?|spoke|"
+        r"communicated|coordinat(?:ed|ion))",
+        re.I,
+    )
+    DISPATCH_KW = re.compile(
+        r"\b(?:courier\s+dispatch|dispatch(?:ed|es)?|sent\s+courier|"
+        r"shipment\s+dispatch)",
+        re.I,
+    )
+    PORTAL_KW = re.compile(
+        r"\b(?:portal|sap|erp|tally|sunlight|ornate\s+portal)",
+        re.I,
+    )
+    TRACKING_KW = re.compile(
+        r"\b(?:tracking|courier\s+track|shipment\s+track|track(?:ing|ed)?)",
+        re.I,
+    )
+    STOCK_INV_KW = re.compile(
+        r"\b(?:stock\s+invoice|flasher\s+invoice|stock|flasher|invoice)",
+        re.I,
+    )
 
     _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
     def _has_content(v):
@@ -1619,6 +2059,20 @@ def _build_logistics_detail_sheet(ws, group, *, range_label: str):
         sorted_items = sorted(counts.items(), key=lambda x: -x[1])[:top]
         return ", ".join(f"{name}: {c}" for name, c in sorted_items)
 
+    def _sum_phrase_counts(text, keyword_pattern):
+        """Sum every '<header containing keyword>: N' occurrence."""
+        if not text:
+            return 0
+        total = 0
+        for m in HEADER_NUM_RE.finditer(text):
+            header = m.group(1).strip()
+            if keyword_pattern.search(header):
+                try:
+                    total += int(m.group(2))
+                except ValueError:
+                    pass
+        return total
+
     user_rows = []
     for _, user_reports in group["users"].items():
         sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
@@ -1630,60 +2084,80 @@ def _build_logistics_detail_sheet(ws, group, *, range_label: str):
                 or u.username
             )
 
-        # Build pooled text buffers per area so we can scan them once.
-        transporter_text = []
-        warehouse_text = []
-        shipment_text = []
-        stock_text = []
-        other_op_text = []
-        coord_calls_text = []
-        courier_dispatch_text = []
-        portal_days = 0
+        # Pool EVERY field value across all reports — robust to whatever the
+        # actual DB field keys are.
+        all_text_parts = []
         for r in sorted_reports:
             data = r.data or {}
-            transporter_text.append(str(data.get("truckTransportationCoordination", "") or ""))
-            warehouse_text.append(str(data.get("warehouseCoordination", "") or ""))
-            shipment_text.append(str(data.get("shipmentTracking", "") or ""))
-            for k in ("stockIn", "stockOut", "flasherDataUpload"):
-                stock_text.append(str(data.get(k, "") or ""))
-            other_op_text.append(str(data.get("otherOperationalWork", "") or ""))
-            coord_calls_text.append(str(data.get("freightSharingDetails", "") or ""))
-            courier_dispatch_text.append(str(data.get("courierDispatch", "") or ""))
-            if _has_content(data.get("portalOperations", "")):
+            for k, v in data.items():
+                if k.startswith("__") or v is None:
+                    continue
+                all_text_parts.append(str(v))
+        big_text = "\n".join(all_text_parts)
+
+        # Name lookups across the whole employee corpus.
+        transporter_counts = _count_hits(TRANSPORTERS, big_text)
+        warehouse_counts = _count_hits(WAREHOUSES, big_text)
+
+        # Invoice / waybill IDs (distinct).
+        invoice_ids = set(INVOICE_RE.findall(big_text))
+
+        # Counter metrics: prefer phrase-scanned numbers; fall back to
+        # ID counts / phrase frequencies when no "X – N" line was found.
+        courier_tracking = max(
+            _sum_phrase_counts(big_text, TRACKING_KW),
+            len(invoice_ids),
+        )
+        stock_invoices = max(
+            _sum_phrase_counts(big_text, STOCK_INV_KW),
+            len(invoice_ids),
+        )
+        verified_bills = max(
+            _sum_phrase_counts(big_text, VERIFIED_KW),
+            len(re.findall(r"\bverif\w+\b", big_text, re.I)),
+        )
+
+        # Portal Works = days with any portal-related content.
+        portal_days = 0
+        for r in sorted_reports:
+            day_text_parts = []
+            for k, v in (r.data or {}).items():
+                if k.startswith("__") or v is None:
+                    continue
+                day_text_parts.append(str(v))
+            day_text = " ".join(day_text_parts)
+            if PORTAL_KW.search(day_text):
                 portal_days += 1
 
-        tt = " ".join(transporter_text)
-        wh = " ".join(warehouse_text)
-        sh = " ".join(shipment_text)
-        st = " ".join(stock_text)
-        op = " ".join(other_op_text)
-        cc = " ".join(coord_calls_text)
-        cd = " ".join(courier_dispatch_text)
-
-        transporter_counts = _count_hits(TRANSPORTERS, tt)
-        warehouse_counts = _count_hits(WAREHOUSES, wh)
-
-        courier_tracking_count = len(set(INVOICE_RE.findall(sh)))
-        stock_invoices_count = len(set(INVOICE_RE.findall(st)))
-        verified_bills_count = len(re.findall(r"\bverif\w*", op, re.I))
-        booked_vehicles_count = len(re.findall(r"\bbook(?:ed|ing)?\b", tt, re.I))
-        coord_calls_count = len(re.findall(
-            r"\b(?:call(?:ed|s)?|spoke|communicated|coordinated|coordination)\b",
-            cc, re.I,
-        ))
-        courier_dispatch_count = len(set(INVOICE_RE.findall(cd)))
+        booked_vehicles = max(
+            _sum_phrase_counts(big_text, BOOKED_KW),
+            len(re.findall(
+                r"\b(?:vehicle|truck)s?\s+(?:book(?:ed|ing)?|arranged|placed)\b",
+                big_text, re.I,
+            )),
+        )
+        coord_calls = max(
+            _sum_phrase_counts(big_text, CALL_KW),
+            len(re.findall(
+                r"\b(?:call(?:ed|s)?|spoke)\b", big_text, re.I,
+            )),
+        )
+        courier_dispatch = max(
+            _sum_phrase_counts(big_text, DISPATCH_KW),
+            len(invoice_ids),
+        )
 
         user_rows.append({
             "name": full_name,
             "transporter": _format_names_with_counts(transporter_counts),
             "warehouse": _format_names_with_counts(warehouse_counts),
-            "courier_tracking": courier_tracking_count,
-            "stock_invoices": stock_invoices_count,
-            "verified_bills": verified_bills_count,
+            "courier_tracking": courier_tracking,
+            "stock_invoices": stock_invoices,
+            "verified_bills": verified_bills,
             "portal": portal_days,
-            "booked_vehicles": booked_vehicles_count,
-            "coord_calls": coord_calls_count,
-            "courier_dispatch": courier_dispatch_count,
+            "booked_vehicles": booked_vehicles,
+            "coord_calls": coord_calls,
+            "courier_dispatch": courier_dispatch,
         })
     user_rows.sort(key=lambda r: r["name"].lower())
 
@@ -1917,7 +2391,7 @@ def _build_marketing_detail_sheet(ws, group, *, range_label: str):
     _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
 
     headers = [
-        "Employee", "Videos Created / Edited",
+        "Employee", "Emails / Videos / Edited",
         "PPT / PDF / Brochures", "Content Writing", "SEO", "Reporting",
     ]
     for i, h in enumerate(headers, start=2):
