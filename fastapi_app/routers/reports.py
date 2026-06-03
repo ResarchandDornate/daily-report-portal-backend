@@ -661,6 +661,8 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
         block_start = None
         block_name = None
         block_ranges: list[tuple[str, int, int]] = []
+        bold_name_font = Font(bold=True, size=10, color="1A1A1A")
+        name_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
         for r in all_reports:
             name = _emp_name(r.user)
@@ -672,7 +674,7 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
                 if block_start is not None:
                     block_ranges.append((block_name, block_start, row_idx - 1))
                 _put(ws, row_idx, 3, name,
-                     font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+                     font=bold_name_font, fill=_ROW_FILL, align=name_align)
                 block_start = row_idx
                 block_name = name
                 prev_name = name
@@ -680,7 +682,7 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
                 # Continuation row — leave the name cell empty so the merge
                 # span shows the name once at the top.
                 _put(ws, row_idx, 3, "",
-                     font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+                     font=bold_name_font, fill=_ROW_FILL, align=name_align)
             for i, f in enumerate(fields):
                 key = f.get("key") or ""
                 v = (r.data or {}).get(key, "")
@@ -705,8 +707,9 @@ def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str 
                     end_row=end_r, end_column=3,
                 )
                 top_cell = ws.cell(row=start_r, column=3)
+                top_cell.font = bold_name_font
                 top_cell.alignment = Alignment(
-                    horizontal="left", vertical="center", wrap_text=True,
+                    horizontal="left", vertical="top", wrap_text=True,
                 )
 
     _apply_table_borders(
