@@ -452,6 +452,7 @@ def export_xlsx(
     design_group = None
     procurement_group = None
     reception_group = None
+    hr_group = None
     other_groups = []
     for group in by_dept.values():
         slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
@@ -466,6 +467,11 @@ def export_xlsx(
             slug_l in ("reception", "frontoffice", "front_office", "front-office")
             or "reception" in name_l
             or "front office" in name_l
+        )
+        is_hr = (
+            slug_l in ("hr", "humanresources", "human_resources", "human-resources")
+            or name_l in ("hr", "human resources")
+            or "human resources" in name_l
         )
         if slug == "sales":
             sales_group = group
@@ -491,6 +497,8 @@ def export_xlsx(
             procurement_group = group
         elif is_reception:
             reception_group = group
+        elif is_hr:
+            hr_group = group
         else:
             other_groups.append(group)
 
@@ -548,6 +556,10 @@ def export_xlsx(
     if reception_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Reception — Detail"))
         _build_dept_detail_sheet(ws, reception_group, range_label=range_label)
+
+    if hr_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "HR — Detail"))
+        _build_hr_detail_sheet(ws, hr_group, range_label=range_label)
 
     if other_groups:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
@@ -1398,6 +1410,304 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
         _put(ws, row_idx, 6, sum(r["kusum_calls"] for r in user_rows),
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
         _put(ws, row_idx, 7, sum(r["subtotal"] for r in user_rows),
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
+
+    summary_last_row = row_idx if user_rows else row_idx - 1
+    _apply_table_borders(
+        ws, header_row=4,
+        last_row=summary_last_row,
+        first_col=2, last_col=last_col,
+    )
+    _append_daily_reports_section(ws, group, start_row=summary_last_row)
+    ws.freeze_panes = "C5"
+    _set_print_landscape_fit(ws)
+
+
+def _build_hr_detail_sheet(ws, group, *, range_label: str):
+    """HR department — 6 aggregated columns matching the daily-report form:
+        • Recruitment / Screening          (CV review + interview totals)
+        • Induction / Onboarding           (new joiners onboarded)
+        • Exit Process                     (employees exited, with names)
+        • Attendance, Payroll & Compliance (days with content)
+        • Happay & Conveyance              (days with content)
+        • Other Work                       (condensed text)
+      + Subtotal column.
+
+    Each numeric column is the MAX of:
+      (a) days the matching field had real content, AND
+      (b) phrase-scanned "X – N" totals inside that field's text.
+    So if HR explicitly writes "CVs reviewed – 8", the 8 wins; otherwise the
+    day count anchors the value to what's visible in the daily reports.
+    """
+    last_col = 9  # A margin + B Employee + 6 form cols + Subtotal
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 22
+    # Recruit, Induct, Exit, Att/Pay, Happay, Other, Subtotal
+    widths = [40, 32, 40, 22, 22, 50, 12]
+    for i, w in enumerate(widths, start=3):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    _merge_title(ws, 1, last_col, "HR — summary table", _TITLE_FONT)
+    ws.row_dimensions[1].height = 26
+    n_users = len(group["users"])
+    n_reports = sum(len(rs) for rs in group["users"].values())
+    subtitle = (
+        f"{range_label}  |  "
+        f"{n_users} {'employee' if n_users == 1 else 'employees'}  ·  "
+        f"{n_reports} reports submitted"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Employee",
+        "Recruitment / Screening",
+        "Induction / Onboarding",
+        "Exit Process (with names)",
+        "Attendance, Payroll & Compliance",
+        "Happay & Conveyance",
+        "Other Work",
+        "Subtotal",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 34
+
+    num_font = Font(size=10, color="1A1A1A")
+    right_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    body_left = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    subtotal_bold = Font(bold=True, size=10, color="1A1A1A")
+
+    _NULL_TOKENS = {"", "na", "n/a", "n.a.", "n.a", "-", "—", "nil", "none", "on leave"}
+    def _has_content(v):
+        s = ("" if v is None else str(v)).strip()
+        return s.lower() not in _NULL_TOKENS
+
+    # ---- Auto-detect each metric's actual field by label / key match ----
+    dept_fields = list(group["dept"].report_fields) if group["dept"] and group["dept"].report_fields else []
+
+    def _match(field, *patterns):
+        text = ((field.get("label") or "") + " " + (field.get("key") or "")).lower()
+        return all(re.search(p, text) for p in patterns)
+
+    recruit_keys: list[str] = []
+    induct_keys: list[str] = []
+    exit_keys: list[str] = []
+    attend_keys: list[str] = []
+    happay_keys: list[str] = []
+    other_keys: list[str] = []
+    for f in dept_fields:
+        if _match(f, r"recruit|screen|interview|cv|resume"):
+            recruit_keys.append(f["key"])
+        elif _match(f, r"induct|onboard|joining|new\s+joiner"):
+            induct_keys.append(f["key"])
+        elif _match(f, r"exit|resign|relieving|f\s*&\s*f|full\s+and\s+final"):
+            exit_keys.append(f["key"])
+        elif _match(f, r"attend|payroll|complian|salary|leave"):
+            attend_keys.append(f["key"])
+        elif _match(f, r"happay|conveyance|expense|reimbursement"):
+            happay_keys.append(f["key"])
+        elif _match(f, r"other"):
+            other_keys.append(f["key"])
+
+    # Generic "<header containing keyword>: N" phrase scanner.
+    HEADER_NUM_RE = re.compile(r"([^\n.;]{1,120}?)\s*[–\-:]\s*(\d+)\b", re.I)
+
+    # Keyword patterns used to filter phrase headers per metric.
+    # Recruitment / Screening is split into TWO sub-counts shown inline:
+    #   Recruits   — actual hires / offers / joiners under the recruit field
+    #   Screening  — CV / resume / interview / shortlist activity
+    RECRUITS_KW  = re.compile(r"\b(?:recruit|hire(?:d)?|offer(?:ed)?|select(?:ed)?|joined|joining)", re.I)
+    SCREENING_KW = re.compile(r"\b(?:cv|resume|screen|interview|shortlist|applicant|candidate)", re.I)
+    RECRUIT_KW   = re.compile(r"\b(?:cv|resume|candidate|interview|screen|shortlist|applicant|recruit|hire|offer|select)", re.I)
+    INDUCT_KW = re.compile(r"\b(?:induct|onboard|joiner|joined|orientation)", re.I)
+    EXIT_KW = re.compile(r"\b(?:exit|resign|reliev|f\s*&\s*f|full\s+and\s+final|separat)", re.I)
+    ATTEND_KW = re.compile(r"\b(?:attend|payroll|salary|leave|complian)", re.I)
+    HAPPAY_KW = re.compile(r"\b(?:happay|conveyance|expense|reimburs)", re.I)
+
+    # Person-name extractor — used for the Exit Process column.  Two or more
+    # title-case words, filtered by a blacklist of common non-names.
+    NAMEY_RE = re.compile(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,2})\b")
+    NAME_BLACKLIST = {
+        "Note", "Status", "Date", "Done", "Pending", "Completed", "Yes", "No",
+        "Today", "Tomorrow", "Yesterday", "Mon", "Tue", "Wed", "Thu", "Fri",
+        "Sat", "Sun", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+        "Saturday", "Sunday", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        "Exit", "Process", "Resign", "Resigned", "Relieving", "Leave",
+        "Total", "Subtotal", "Other", "Work", "Works", "Reason", "Notice",
+        "Period", "Final", "Settlement",
+    }
+
+    def _sum_phrase_counts(text, keyword_pattern):
+        if not text:
+            return 0
+        total = 0
+        for m in HEADER_NUM_RE.finditer(text):
+            header = m.group(1).strip()
+            if keyword_pattern.search(header):
+                try:
+                    total += int(m.group(2))
+                except ValueError:
+                    pass
+        return total
+
+    def _scan_names(text):
+        out: dict[str, int] = {}
+        if not text:
+            return out
+        for m in NAMEY_RE.finditer(text):
+            name = m.group(1).strip()
+            first = name.split()[0]
+            if first in NAME_BLACKLIST:
+                continue
+            if " " not in name:
+                continue
+            out[name] = out.get(name, 0) + 1
+        return out
+
+    user_rows = []
+    for _, user_reports in group["users"].items():
+        sorted_reports = sorted(user_reports, key=lambda r: r.date or date_type.min)
+        u = sorted_reports[0].user
+        full_name = ""
+        if u:
+            full_name = (
+                f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                or u.username
+            )
+
+        def days_with(keys):
+            if not keys:
+                return 0
+            c = 0
+            for r in sorted_reports:
+                data = r.data or {}
+                if any(_has_content(data.get(k, "")) for k in keys):
+                    c += 1
+            return c
+
+        def pooled(keys):
+            parts = []
+            for r in sorted_reports:
+                data = r.data or {}
+                for k in keys:
+                    v = data.get(k)
+                    if v is not None and _has_content(v):
+                        parts.append(str(v))
+            return "\n".join(parts)
+
+        recruit_days = days_with(recruit_keys)
+        induct_days  = days_with(induct_keys)
+        exit_days    = days_with(exit_keys)
+        attend_days  = days_with(attend_keys)
+        happay_days  = days_with(happay_keys)
+
+        recruit_text = pooled(recruit_keys)
+        induct_text  = pooled(induct_keys)
+        exit_text    = pooled(exit_keys)
+        attend_text  = pooled(attend_keys)
+        happay_text  = pooled(happay_keys)
+        other_text   = pooled(other_keys)
+
+        # Recruitment / Screening — split into two sub-counts:
+        #   Recruits  = explicit hires / offers / joiners (RECRUITS_KW)
+        #   Screening = CV / resume / interview / shortlist activity
+        recruits_count_phrase  = _sum_phrase_counts(recruit_text, RECRUITS_KW)
+        screening_count_phrase = _sum_phrase_counts(recruit_text, SCREENING_KW)
+        # If neither phrase matched but the field has content, attribute the
+        # day count to Screening (the typical recruitment activity).
+        if recruits_count_phrase == 0 and screening_count_phrase == 0 and recruit_days > 0:
+            screening_count_phrase = recruit_days
+        recruits_count  = recruits_count_phrase
+        screening_count = screening_count_phrase
+        recruit_count   = recruits_count + screening_count
+        recruit_disp = (
+            f"Recruits: {recruits_count}\nScreening: {screening_count}"
+            if (recruits_count or screening_count) else _DASH
+        )
+
+        # Induction / Onboarding — phrase total + day count.
+        induct_phrase = _sum_phrase_counts(induct_text, INDUCT_KW)
+        induct_count = max(induct_phrase, induct_days)
+        induct_disp = (
+            f"Inductions: {induct_phrase}, Days: {induct_days}"
+            if (induct_phrase or induct_days) else _DASH
+        )
+
+        # Exit Process — extract employee names mentioned in the exit field.
+        exit_names = _scan_names(exit_text)
+        exit_phrase = _sum_phrase_counts(exit_text, EXIT_KW)
+        exit_count = max(exit_phrase, len(exit_names), exit_days)
+        if exit_names:
+            top_names = sorted(exit_names.items(), key=lambda x: -x[1])[:6]
+            exit_disp = (
+                ", ".join(n for n, _ in top_names)
+                + f" (Total: {exit_count})"
+            )
+        elif exit_count:
+            exit_disp = f"Total: {exit_count}"
+        else:
+            exit_disp = _DASH
+
+        # Attendance / Payroll / Compliance — phrase total + day count.
+        attend_phrase = _sum_phrase_counts(attend_text, ATTEND_KW)
+        attend_count = max(attend_phrase, attend_days)
+        attend_disp = (
+            f"Entries: {attend_phrase}, Days: {attend_days}"
+            if (attend_phrase or attend_days) else _DASH
+        )
+
+        # Happay & Conveyance — phrase total + day count.
+        happay_phrase = _sum_phrase_counts(happay_text, HAPPAY_KW)
+        happay_count = max(happay_phrase, happay_days)
+        happay_disp = (
+            f"Entries: {happay_phrase}, Days: {happay_days}"
+            if (happay_phrase or happay_days) else _DASH
+        )
+
+        # Other Work — condensed text (AI-style headline join).
+        other_disp = _condense_summary(other_text, max_chars=160) if other_text else _DASH
+
+        row_subtotal = recruit_count + induct_count + exit_count + attend_count + happay_count
+
+        user_rows.append({
+            "name": full_name,
+            "recruit_disp": recruit_disp, "recruit_count": recruit_count,
+            "induct_disp": induct_disp,   "induct_count": induct_count,
+            "exit_disp": exit_disp,       "exit_count": exit_count,
+            "attend_disp": attend_disp,   "attend_count": attend_count,
+            "happay_disp": happay_disp,   "happay_count": happay_count,
+            "other_disp": other_disp,
+            "subtotal": row_subtotal,
+        })
+    user_rows.sort(key=lambda r: r["name"].lower())
+
+    row_idx = 5
+    for row in user_rows:
+        _put(ws, row_idx, 2, row["name"],
+             font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
+        for col, key in [
+            (3, "recruit_disp"), (4, "induct_disp"), (5, "exit_disp"),
+            (6, "attend_disp"), (7, "happay_disp"), (8, "other_disp"),
+        ]:
+            txt = row[key]
+            _put(ws, row_idx, col, txt,
+                 font=_BODY_FONT if txt != _DASH else _MUTED_FONT,
+                 fill=_ROW_FILL,
+                 align=body_left if txt != _DASH else right_align)
+        _put(ws, row_idx, 9, row["subtotal"],
+             font=subtotal_bold, fill=_ROW_FILL, align=right_align)
+        row_idx += 1
+
+    if user_rows:
+        _put(ws, row_idx, 2, "Total",
+             font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
+        # Text cols 3-8 stay blank in the total row.
+        for c in range(3, 9):
+            _put(ws, row_idx, c, "", fill=_TOTAL_FILL)
+        _put(ws, row_idx, 9,
+             sum(r["subtotal"] for r in user_rows),
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 
     summary_last_row = row_idx if user_rows else row_idx - 1
