@@ -502,6 +502,11 @@ def export_xlsx(
         else:
             other_groups.append(group)
 
+    # All Employees roster — first tab so HR sees the headcount snapshot
+    # before any per-department breakdown.
+    ws = wb.create_sheet(title=_unique_sheet_name(wb, "All Employees"))
+    _build_all_employees_sheet(ws, db, range_label=range_label, today_label=today_label)
+
     if sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales — Detail"))
         _build_dept_detail_sheet(ws, sales_group, range_label=range_label)
@@ -636,6 +641,167 @@ def _apply_table_borders(ws, *, header_row: int, last_row: int, first_col: int, 
     for r in range(header_row, last_row + 1):
         for c in range(first_col, last_col + 1):
             ws.cell(row=r, column=c).border = _CELL_BORDER
+
+
+def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
+    """Roster snapshot of every active employee — matches the on-screen
+    All Employees page (sorted by department, then name).  Columns:
+      Organisation | S. No. | Name | Department | Reporting Manager |
+      Date of Joining | This Week | This Month
+    The This Week / This Month cells show "<filled> / <total>" workdays
+    derived from the reports filed across the current calendar week /
+    month respectively — same logic as the on-screen badges.
+    """
+    NON_REPORTING_DEPTS = {"rd", "finance"}
+
+    employees = (
+        db.query(User)
+        .filter(User.is_active.is_(True))
+        .filter(User.role != "hr")
+        .all()
+    )
+
+    # Date windows for the week / month counters.
+    today = date_type.today()
+    # Current calendar week (Mon → Fri).
+    monday = today - timedelta(days=today.weekday())
+    friday = monday + timedelta(days=4)
+    # Current calendar month.
+    month_first = today.replace(day=1)
+    if today.month == 12:
+        next_first = date_type(today.year + 1, 1, 1)
+    else:
+        next_first = date_type(today.year, today.month + 1, 1)
+    month_last = next_first - timedelta(days=1)
+    # Total Mon-Fri workdays in the full calendar month.
+    month_workdays = 0
+    d = month_first
+    while d <= month_last:
+        if d.weekday() < 5:
+            month_workdays += 1
+        d += timedelta(days=1)
+    month_label = month_first.strftime("%b").upper()
+
+    # Pull every report in the week + month windows in one go.
+    week_reports = (
+        db.query(DailyReport.user_id, DailyReport.date)
+        .filter(DailyReport.date >= monday, DailyReport.date <= friday)
+        .all()
+    )
+    month_reports = (
+        db.query(DailyReport.user_id, DailyReport.date)
+        .filter(DailyReport.date >= month_first, DailyReport.date <= month_last)
+        .all()
+    )
+
+    # week_submitted_by_user[uid] = highest weekday index reached (Mon=1..Fri=5).
+    week_submitted_by_user: dict[int, int] = {}
+    for uid, dt in week_reports:
+        if dt.weekday() >= 5:
+            continue
+        idx = dt.weekday() + 1  # Mon=0→1 ... Fri=4→5
+        if idx > week_submitted_by_user.get(uid, 0):
+            week_submitted_by_user[uid] = idx
+
+    # month_submitted_by_user[uid] = distinct weekdays filed in the month.
+    month_dates_by_user: dict[int, set] = {}
+    for uid, dt in month_reports:
+        if dt.weekday() >= 5:
+            continue
+        month_dates_by_user.setdefault(uid, set()).add(dt)
+    month_count_by_user = {
+        uid: len(dates) for uid, dates in month_dates_by_user.items()
+    }
+
+    def _emp_dept_name(e):
+        return (e.department.name if e.department else "") or ""
+
+    def _full_name(e):
+        n = f"{(e.first_name or '').strip()} {(e.last_name or '').strip()}".strip()
+        return n or e.username or "—"
+
+    # Sort: department A→Z (empties last), then by full name.
+    def sort_key(e):
+        dn = _emp_dept_name(e)
+        return (
+            1 if not dn else 0,
+            dn.lower(),
+            _full_name(e).lower(),
+        )
+    employees.sort(key=sort_key)
+
+    last_col = 10  # A margin + 8 data cols (B..I) — actually 9 cols: B..J
+    # Columns: B Organisation, C S.No, D Name, E Department, F Reporting Manager,
+    # G Date of Joining, H This Week, I This Month   → last_col = 9
+    last_col = 9
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 14   # Organisation
+    ws.column_dimensions["C"].width = 6    # S. No.
+    ws.column_dimensions["D"].width = 26   # Name
+    ws.column_dimensions["E"].width = 20   # Department
+    ws.column_dimensions["F"].width = 22   # Reporting Manager
+    ws.column_dimensions["G"].width = 18   # Date of Joining
+    ws.column_dimensions["H"].width = 14   # This Week
+    ws.column_dimensions["I"].width = 14   # This Month
+
+    _merge_title(ws, 1, last_col, "All Employees — Roster", _TITLE_FONT)
+    ws.row_dimensions[1].height = 28
+    subtitle = (
+        f"{len(employees)} active reporting employees  |  "
+        f"Generated: {today_label}  |  Range: {range_label}"
+    )
+    _merge_title(ws, 2, last_col, subtitle, _SUBTITLE_FONT)
+
+    headers = [
+        "Organisation", "S. No.", "Name", "Department",
+        "Reporting Manager", "Date of Joining",
+        "This Week", f"This Month ({month_label})",
+    ]
+    for i, h in enumerate(headers, start=2):
+        _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
+    ws.row_dimensions[4].height = 30
+
+    body_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    name_font = Font(bold=True, size=10, color="1A1A1A")
+
+    row_idx = 5
+    serial = 0
+    for emp in employees:
+        # Skip non-reporting depts (R&D, Finance) — matches the on-screen
+        # "Total Employees" headline card scope.
+        if emp.department and emp.department.slug in NON_REPORTING_DEPTS:
+            continue
+        serial += 1
+        _put(ws, row_idx, 2, emp.organisation or "—",
+             font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 3, serial,
+             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
+        _put(ws, row_idx, 4, _full_name(emp),
+             font=name_font, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 5, _emp_dept_name(emp) or _DASH,
+             font=_BODY_FONT if emp.department else _MUTED_FONT,
+             fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 6, emp.reporting_manager or "—",
+             font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
+        _put(ws, row_idx, 7,
+             emp.date_of_joining.strftime("%a, %d %b %Y") if emp.date_of_joining else "—",
+             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
+        wk = week_submitted_by_user.get(emp.id, 0)
+        _put(ws, row_idx, 8, f"{wk} / 5",
+             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
+        mo = month_count_by_user.get(emp.id, 0)
+        _put(ws, row_idx, 9, f"{mo} / {month_workdays}",
+             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
+        row_idx += 1
+
+    last_row = row_idx - 1 if serial > 0 else 4
+    _apply_table_borders(
+        ws, header_row=4, last_row=last_row, first_col=2, last_col=last_col,
+    )
+    ws.freeze_panes = "B5"
+    _set_print_landscape_fit(ws)
 
 
 def _append_daily_reports_section(ws, group, *, start_row: int, dept_label: str | None = None) -> int:
