@@ -453,15 +453,26 @@ def export_xlsx(
     procurement_group = None
     reception_group = None
     hr_group = None
+    om_group = None          # Operations & Maintenance
+    finance_group = None
+    rd_bess_group = None     # R&D BESS
+    web_dev_group = None
     other_groups = []
     for group in by_dept.values():
         slug = getattr(group["dept"], "slug", "") if group["dept"] else ""
         name = (getattr(group["dept"], "name", "") if group["dept"] else "") or ""
         slug_l = (slug or "").lower()
         name_l = name.lower()
+        # "Sales Head" / "Sales Enquiry" share the same detail tab — they're
+        # the same team, just renamed.  Keep both old + new detections so
+        # existing DB rows with either slug continue to route correctly.
         is_sales_head = (
-            slug_l in ("saleshead", "sales_head", "sales-head")
+            slug_l in (
+                "saleshead", "sales_head", "sales-head",
+                "salesenquiry", "sales_enquiry", "sales-enquiry",
+            )
             or ("sales" in name_l and "head" in name_l)
+            or ("sales" in name_l and "enquir" in name_l)
         )
         is_reception = (
             slug_l in ("reception", "frontoffice", "front_office", "front-office")
@@ -472,6 +483,39 @@ def export_xlsx(
             slug_l in ("hr", "humanresources", "human_resources", "human-resources")
             or name_l in ("hr", "human resources")
             or "human resources" in name_l
+        )
+        # O&M (Operations & Maintenance) — slug may use any of these forms.
+        is_om = (
+            slug_l in (
+                "om", "oandm", "o_and_m", "o-m", "operations",
+                "operationsmaintenance", "operations_maintenance",
+            )
+            or name_l in ("o&m", "o & m", "operations & maintenance",
+                          "operations and maintenance")
+            or ("operation" in name_l and "maintenance" in name_l)
+        )
+        is_finance = (
+            slug_l in ("finance", "accounts", "accounting", "fin")
+            or name_l in ("finance", "accounts", "accounting")
+        )
+        # R&D BESS — Research & Development for Battery Energy Storage Systems.
+        is_rd_bess = (
+            slug_l in (
+                "rdbess", "rd_bess", "rd-bess", "r_and_d_bess",
+                "rndbess", "researchbess",
+            )
+            or ("r&d" in name_l and "bess" in name_l)
+            or ("r & d" in name_l and "bess" in name_l)
+            or ("research" in name_l and "bess" in name_l)
+            or ("rd" in name_l and "bess" in name_l)
+        )
+        is_web_dev = (
+            slug_l in (
+                "webdev", "web_dev", "web-dev", "webdevelopment",
+                "web_development", "web-development",
+            )
+            or name_l in ("web dev", "web development", "webdev")
+            or ("web" in name_l and "dev" in name_l)
         )
         if slug == "sales":
             sales_group = group
@@ -499,6 +543,14 @@ def export_xlsx(
             reception_group = group
         elif is_hr:
             hr_group = group
+        elif is_om:
+            om_group = group
+        elif is_finance:
+            finance_group = group
+        elif is_rd_bess:
+            rd_bess_group = group
+        elif is_web_dev:
+            web_dev_group = group
         else:
             other_groups.append(group)
 
@@ -512,7 +564,13 @@ def export_xlsx(
         _build_dept_detail_sheet(ws, sales_group, range_label=range_label)
 
     if sales_head_group:
-        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales Head — Detail"))
+        # Tab title follows the department's actual name in the DB — so
+        # renaming "Sales Head" → "Sales Enquiry" automatically updates here.
+        sh_name = (
+            getattr(sales_head_group["dept"], "name", "")
+            if sales_head_group.get("dept") else ""
+        ) or "Sales Enquiry"
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, f"{sh_name} — Detail"))
         _build_dept_detail_sheet(ws, sales_head_group, range_label=range_label)
 
     if sales_service_group:
@@ -565,6 +623,36 @@ def export_xlsx(
     if hr_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "HR — Detail"))
         _build_hr_detail_sheet(ws, hr_group, range_label=range_label)
+
+    if om_group:
+        # Title follows the department's actual name in the DB so "O&M" /
+        # "Operations & Maintenance" / any rename surfaces verbatim.
+        om_name = (
+            getattr(om_group["dept"], "name", "")
+            if om_group.get("dept") else ""
+        ) or "O&M"
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, f"{om_name} — Detail"))
+        _build_dept_detail_sheet(ws, om_group, range_label=range_label)
+
+    if finance_group:
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, "Finance — Detail"))
+        _build_dept_detail_sheet(ws, finance_group, range_label=range_label)
+
+    if rd_bess_group:
+        rd_name = (
+            getattr(rd_bess_group["dept"], "name", "")
+            if rd_bess_group.get("dept") else ""
+        ) or "R&D BESS"
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, f"{rd_name} — Detail"))
+        _build_dept_detail_sheet(ws, rd_bess_group, range_label=range_label)
+
+    if web_dev_group:
+        wd_name = (
+            getattr(web_dev_group["dept"], "name", "")
+            if web_dev_group.get("dept") else ""
+        ) or "Web Dev"
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, f"{wd_name} — Detail"))
+        _build_dept_detail_sheet(ws, web_dev_group, range_label=range_label)
 
     if other_groups:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Detailed Summary"))
@@ -673,28 +761,35 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     else:
         next_first = date_type(today.year, today.month + 1, 1)
     month_last = next_first - timedelta(days=1)
-    # Total Mon-Fri workdays in the full calendar month.
-    month_workdays = 0
+    # Mon-Fri workdays from start-of-month through TODAY — this is the
+    # denominator HR wants on the "This Month" cell ("days they SHOULD have
+    # filed so far this month").  Full-month workday count is no longer
+    # used; the elapsed-so-far figure makes the ratio meaningful before
+    # month-end (e.g. "0 / 16" on 22 Jun instead of "0 / 22").
+    month_workdays_elapsed = 0
     d = month_first
-    while d <= month_last:
+    while d <= today:
         if d.weekday() < 5:
-            month_workdays += 1
+            month_workdays_elapsed += 1
         d += timedelta(days=1)
     month_label = month_first.strftime("%b").upper()
 
-    # Pull every report in the week + month windows in one go.
+    # Pull every report in the week + month windows in one go.  Include
+    # `data` for the month query so we can detect leave rows (`__leave__=1`).
     week_reports = (
         db.query(DailyReport.user_id, DailyReport.date)
         .filter(DailyReport.date >= monday, DailyReport.date <= friday)
         .all()
     )
     month_reports = (
-        db.query(DailyReport.user_id, DailyReport.date)
+        db.query(DailyReport.user_id, DailyReport.date, DailyReport.data)
         .filter(DailyReport.date >= month_first, DailyReport.date <= month_last)
         .all()
     )
 
     # week_submitted_by_user[uid] = highest weekday index reached (Mon=1..Fri=5).
+    # Leave rows count as "submitted" for the week badge (the employee did
+    # account for the day, even if it was a leave entry).
     week_submitted_by_user: dict[int, int] = {}
     for uid, dt in week_reports:
         if dt.weekday() >= 5:
@@ -704,13 +799,24 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
             week_submitted_by_user[uid] = idx
 
     # month_submitted_by_user[uid] = distinct weekdays filed in the month.
+    # leave_count_by_user[uid]     = distinct DAYS the employee was on leave
+    # (any day, including weekends — leaves are entered per real calendar day).
     month_dates_by_user: dict[int, set] = {}
-    for uid, dt in month_reports:
+    leave_dates_by_user: dict[int, set] = {}
+    for uid, dt, data in month_reports:
+        is_leave = bool(data) and str(data.get("__leave__", "")) == "1"
+        if is_leave:
+            leave_dates_by_user.setdefault(uid, set()).add(dt)
+            # Leave rows still count toward "filed for this weekday" so the
+            # employee isn't double-penalised on the missing list.
         if dt.weekday() >= 5:
             continue
         month_dates_by_user.setdefault(uid, set()).add(dt)
     month_count_by_user = {
         uid: len(dates) for uid, dates in month_dates_by_user.items()
+    }
+    leave_count_by_user = {
+        uid: len(dates) for uid, dates in leave_dates_by_user.items()
     }
 
     def _emp_dept_name(e):
@@ -730,10 +836,9 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         )
     employees.sort(key=sort_key)
 
-    last_col = 10  # A margin + 8 data cols (B..I) — actually 9 cols: B..J
     # Columns: B Organisation, C S.No, D Name, E Department, F Reporting Manager,
-    # G Date of Joining, H This Week, I This Month   → last_col = 9
-    last_col = 9
+    # G Date of Joining, H This Week, I This Month, J Leaves  → last_col = 10
+    last_col = 10
 
     ws.column_dimensions["A"].width = 3
     ws.column_dimensions["B"].width = 14   # Organisation
@@ -744,6 +849,7 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     ws.column_dimensions["G"].width = 18   # Date of Joining
     ws.column_dimensions["H"].width = 14   # This Week
     ws.column_dimensions["I"].width = 14   # This Month
+    ws.column_dimensions["J"].width = 12   # Leaves
 
     _merge_title(ws, 1, last_col, "All Employees — Roster", _TITLE_FONT)
     ws.row_dimensions[1].height = 28
@@ -757,6 +863,7 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         "Organisation", "S. No.", "Name", "Department",
         "Reporting Manager", "Date of Joining",
         "This Week", f"This Month ({month_label})",
+        f"Leaves ({month_label})",
     ]
     for i, h in enumerate(headers, start=2):
         _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
@@ -765,6 +872,12 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     body_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
     center_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
     name_font = Font(bold=True, size=10, color="1A1A1A")
+    # Highlight scheme for employees who haven't filed any report in the
+    # current calendar month — every cell on that row gets a rose-pink fill
+    # and a bold dark-red name so it pops at a glance.
+    miss_fill = PatternFill("solid", fgColor="FFE4E6")          # rose-100
+    miss_name_font = Font(bold=True, size=10, color="9F1239")   # rose-800
+    miss_body_font = Font(size=10, color="9F1239")              # rose-800
 
     row_idx = 5
     serial = 0
@@ -774,26 +887,38 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         if emp.department and emp.department.slug in NON_REPORTING_DEPTS:
             continue
         serial += 1
+        wk = week_submitted_by_user.get(emp.id, 0)
+        mo = month_count_by_user.get(emp.id, 0)
+        # "Not filing" = zero distinct days submitted this calendar month.
+        is_missing = mo == 0
+        row_fill = miss_fill if is_missing else _ROW_FILL
+        body_f = miss_body_font if is_missing else _BODY_FONT
+        name_f = miss_name_font if is_missing else name_font
         _put(ws, row_idx, 2, emp.organisation or "—",
-             font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
+             font=body_f, fill=row_fill, align=body_left)
         _put(ws, row_idx, 3, serial,
-             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
+             font=body_f, fill=row_fill, align=center_align)
         _put(ws, row_idx, 4, _full_name(emp),
-             font=name_font, fill=_ROW_FILL, align=body_left)
+             font=name_f, fill=row_fill, align=body_left)
         _put(ws, row_idx, 5, _emp_dept_name(emp) or _DASH,
-             font=_BODY_FONT if emp.department else _MUTED_FONT,
-             fill=_ROW_FILL, align=body_left)
+             font=body_f if emp.department else _MUTED_FONT,
+             fill=row_fill, align=body_left)
         _put(ws, row_idx, 6, emp.reporting_manager or "—",
-             font=_BODY_FONT, fill=_ROW_FILL, align=body_left)
+             font=body_f, fill=row_fill, align=body_left)
         _put(ws, row_idx, 7,
              emp.date_of_joining.strftime("%a, %d %b %Y") if emp.date_of_joining else "—",
-             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
-        wk = week_submitted_by_user.get(emp.id, 0)
+             font=body_f, fill=row_fill, align=center_align)
         _put(ws, row_idx, 8, f"{wk} / 5",
-             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
-        mo = month_count_by_user.get(emp.id, 0)
-        _put(ws, row_idx, 9, f"{mo} / {month_workdays}",
-             font=_BODY_FONT, fill=_ROW_FILL, align=center_align)
+             font=body_f, fill=row_fill, align=center_align)
+        # "This Month" denominator = workdays elapsed from 1st through today
+        # (HR's ask) — so a non-filer reads "0 / 16" on 22 Jun, not "0 / 22".
+        _put(ws, row_idx, 9, f"{mo} / {month_workdays_elapsed}",
+             font=body_f, fill=row_fill, align=center_align)
+        # Leaves (current calendar month) — count of distinct days the
+        # employee filed a leave entry (`__leave__=1`).
+        lv = leave_count_by_user.get(emp.id, 0)
+        _put(ws, row_idx, 10, lv,
+             font=body_f, fill=row_fill, align=center_align)
         row_idx += 1
 
     last_row = row_idx - 1 if serial > 0 else 4
@@ -1605,12 +1730,12 @@ def _build_hr_detail_sheet(ws, group, *, range_label: str):
     So if HR explicitly writes "CVs reviewed – 8", the 8 wins; otherwise the
     day count anchors the value to what's visible in the daily reports.
     """
-    last_col = 9  # A margin + B Employee + 6 form cols + Subtotal
+    last_col = 10  # A margin + B Employee + 7 form cols + Subtotal
 
     ws.column_dimensions["A"].width = 3
     ws.column_dimensions["B"].width = 22
-    # Recruit, Induct, Exit, Att/Pay, Happay, Other, Subtotal
-    widths = [40, 32, 40, 22, 22, 50, 12]
+    # Recruit, Induct, Exit, Att/Pay, Happay, MIS, Other, Subtotal
+    widths = [40, 32, 40, 22, 22, 22, 50, 12]
     for i, w in enumerate(widths, start=3):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1632,6 +1757,7 @@ def _build_hr_detail_sheet(ws, group, *, range_label: str):
         "Exit Process (with names)",
         "Attendance, Payroll & Compliance",
         "Happay & Conveyance",
+        "MIS & Reports",
         "Other Work",
         "Subtotal",
     ]
@@ -1649,32 +1775,54 @@ def _build_hr_detail_sheet(ws, group, *, range_label: str):
         s = ("" if v is None else str(v)).strip()
         return s.lower() not in _NULL_TOKENS
 
-    # ---- Auto-detect each metric's actual field by label / key match ----
+    # ---- Auto-detect each metric's actual field key ----
+    # We pool keys from BOTH the current dept schema (`report_fields`) AND
+    # any keys present in actual saved report data — the latter catches the
+    # case where the HR form was renamed (e.g. `recruitment` → `recruitmentScreening`)
+    # but older reports still carry the previous key.
     dept_fields = list(group["dept"].report_fields) if group["dept"] and group["dept"].report_fields else []
+    key_to_label: dict[str, str] = {}
+    for f in dept_fields:
+        k = f.get("key") or ""
+        if k:
+            key_to_label[k] = f.get("label") or ""
+    # Also harvest keys from actual report data so legacy keys count.
+    for _, user_reports in group["users"].items():
+        for r in user_reports:
+            for k in (r.data or {}).keys():
+                if k.startswith("__"):
+                    continue
+                key_to_label.setdefault(k, "")
+    all_known_keys = list(key_to_label.keys())
 
-    def _match(field, *patterns):
-        text = ((field.get("label") or "") + " " + (field.get("key") or "")).lower()
-        return all(re.search(p, text) for p in patterns)
+    def _key_matches(key, pattern):
+        text = (key + " " + key_to_label.get(key, "")).lower()
+        return bool(re.search(pattern, text))
 
     recruit_keys: list[str] = []
     induct_keys: list[str] = []
     exit_keys: list[str] = []
     attend_keys: list[str] = []
     happay_keys: list[str] = []
+    mis_keys: list[str] = []
     other_keys: list[str] = []
-    for f in dept_fields:
-        if _match(f, r"recruit|screen|interview|cv|resume"):
-            recruit_keys.append(f["key"])
-        elif _match(f, r"induct|onboard|joining|new\s+joiner"):
-            induct_keys.append(f["key"])
-        elif _match(f, r"exit|resign|relieving|f\s*&\s*f|full\s+and\s+final"):
-            exit_keys.append(f["key"])
-        elif _match(f, r"attend|payroll|complian|salary|leave"):
-            attend_keys.append(f["key"])
-        elif _match(f, r"happay|conveyance|expense|reimbursement"):
-            happay_keys.append(f["key"])
-        elif _match(f, r"other"):
-            other_keys.append(f["key"])
+    for k in all_known_keys:
+        if _key_matches(k, r"recruit|screen|interview|cv|resume"):
+            recruit_keys.append(k)
+        elif _key_matches(k, r"induct|onboard|joining|new\s+joiner"):
+            induct_keys.append(k)
+        elif _key_matches(k, r"exit|resign|relieving|f\s*&\s*f|full\s+and\s+final"):
+            exit_keys.append(k)
+        elif _key_matches(k, r"happay|conveyance|expense|reimburs"):
+            happay_keys.append(k)
+        elif _key_matches(k, r"\bmis\b|reporting"):
+            # MIS & Reports — must be checked BEFORE attend (which catches
+            # "leave") because a MIS field may also contain leave-related text.
+            mis_keys.append(k)
+        elif _key_matches(k, r"attend|payroll|complian|salary|leave"):
+            attend_keys.append(k)
+        elif _key_matches(k, r"other"):
+            other_keys.append(k)
 
     # Generic "<header containing keyword>: N" phrase scanner.
     HEADER_NUM_RE = re.compile(r"([^\n.;]{1,120}?)\s*[–\-:]\s*(\d+)\b", re.I)
@@ -1768,82 +1916,115 @@ def _build_hr_detail_sheet(ws, group, *, range_label: str):
         exit_days    = days_with(exit_keys)
         attend_days  = days_with(attend_keys)
         happay_days  = days_with(happay_keys)
+        mis_days     = days_with(mis_keys)
 
         recruit_text = pooled(recruit_keys)
         induct_text  = pooled(induct_keys)
         exit_text    = pooled(exit_keys)
         attend_text  = pooled(attend_keys)
         happay_text  = pooled(happay_keys)
+        mis_text     = pooled(mis_keys)
         other_text   = pooled(other_keys)
 
-        # Recruitment / Screening — split into two sub-counts:
-        #   Recruits  = explicit hires / offers / joiners (RECRUITS_KW)
-        #   Screening = CV / resume / interview / shortlist activity
-        recruits_count_phrase  = _sum_phrase_counts(recruit_text, RECRUITS_KW)
-        screening_count_phrase = _sum_phrase_counts(recruit_text, SCREENING_KW)
-        # If neither phrase matched but the field has content, attribute the
-        # day count to Screening (the typical recruitment activity).
-        if recruits_count_phrase == 0 and screening_count_phrase == 0 and recruit_days > 0:
-            screening_count_phrase = recruit_days
-        recruits_count  = recruits_count_phrase
-        screening_count = screening_count_phrase
-        recruit_count   = recruits_count + screening_count
-        recruit_disp = (
-            f"Recruits: {recruits_count}\nScreening: {screening_count}"
-            if (recruits_count or screening_count) else _DASH
+        # Recruitment / Screening — three sub-counts that match what Smita
+        # actually writes:
+        #   Offers / Recruits  = "Offer Released X" / "Offer Releasd X" /
+        #                        "Offer release X" mentions (count of NAMES)
+        #   Screenings         = sum of "Screening- N" / "Screeening- N" /
+        #                        "Screening N" numbers
+        #   Interviews         = "Interview" mentions (count) excluding lines
+        #                        that are pure screening
+        offers_count = len(re.findall(
+            r"\boffer\s+release[ds]?\b", recruit_text, re.I,
+        ))
+        screening_nums = re.findall(
+            r"\bscree+ning[s]?\s*[-–:]?\s*(\d{1,3})\b", recruit_text, re.I,
         )
-
-        # Induction / Onboarding — phrase total + day count.
-        induct_phrase = _sum_phrase_counts(induct_text, INDUCT_KW)
-        induct_count = max(induct_phrase, induct_days)
-        induct_disp = (
-            f"Inductions: {induct_phrase}, Days: {induct_days}"
-            if (induct_phrase or induct_days) else _DASH
-        )
-
-        # Exit Process — extract employee names mentioned in the exit field.
-        exit_names = _scan_names(exit_text)
-        exit_phrase = _sum_phrase_counts(exit_text, EXIT_KW)
-        exit_count = max(exit_phrase, len(exit_names), exit_days)
-        if exit_names:
-            top_names = sorted(exit_names.items(), key=lambda x: -x[1])[:6]
-            exit_disp = (
-                ", ".join(n for n, _ in top_names)
-                + f" (Total: {exit_count})"
+        screenings_count = sum(int(n) for n in screening_nums) if screening_nums else 0
+        # If no explicit number but the field has screening mentions, count
+        # the mentions themselves so we don't drop to zero.
+        if not screenings_count:
+            screenings_count = len(re.findall(
+                r"\bscree+ning[s]?\b", recruit_text, re.I,
+            ))
+        interviews_count = len(re.findall(
+            r"\binterview[s]?\b", recruit_text, re.I,
+        ))
+        if (offers_count or screenings_count or interviews_count):
+            recruit_disp = (
+                f"Offers: {offers_count}\n"
+                f"Screenings: {screenings_count}\n"
+                f"Interviews: {interviews_count}"
             )
+        else:
+            recruit_disp = _DASH
+
+        # Induction / Onboarding — ONE total count (no "Days:" — HR asked
+        # for just the total).  Counts induction/onboarding events: the
+        # bigger of (numbered-list items across all days, day count).
+        numbered_items = len(re.findall(r"(?m)^\s*\d+\s*[.)]\s*", induct_text))
+        induct_count = max(numbered_items, induct_days)
+        induct_disp = (
+            f"Inductions: {induct_count}" if induct_count else _DASH
+        )
+
+        # Exit Process — extract names ONLY from explicit exit-marker
+        # phrases (Experience Letter / Final Payment / Resigned / Reliev),
+        # not from random title-cased words.  Avoids the previous bug where
+        # "Nandlal Payment Calculation" (activity) showed up as a name.
+        EXIT_NAME_RE = re.compile(
+            r"(?:experience\s+letter[\s\-:–]*|final\s+payment[\s\-\(:]*for[\s:]*|"
+            r"final\s+payment[\s\-:–]*|resign(?:ed|ation)\s+(?:of\s+)?|"
+            r"reliev(?:ed|ing)\s+(?:of\s+)?|exit\s+(?:of\s+)?)"
+            r"([A-Z][a-zA-Z]+(?:\s+(?:&|and)\s+[A-Z][a-zA-Z]+)?(?:\s+[A-Z][a-zA-Z]+)?)",
+            re.I,
+        )
+        exit_named: list[str] = []
+        for m in EXIT_NAME_RE.finditer(exit_text):
+            chunk = m.group(1).strip()
+            # Split "X & Y" / "X and Y" into individual names.
+            for piece in re.split(r"\s+(?:&|and)\s+", chunk, flags=re.I):
+                piece = piece.strip().rstrip(",.;")
+                if piece and piece not in exit_named:
+                    exit_named.append(piece)
+        exit_count = max(len(exit_named), exit_days)
+        if exit_named:
+            top_names = exit_named[:6]
+            exit_disp = ", ".join(top_names) + f" (Total: {exit_count})"
         elif exit_count:
             exit_disp = f"Total: {exit_count}"
         else:
             exit_disp = _DASH
 
-        # Attendance / Payroll / Compliance — phrase total + day count.
-        attend_phrase = _sum_phrase_counts(attend_text, ATTEND_KW)
-        attend_count = max(attend_phrase, attend_days)
-        attend_disp = (
-            f"Entries: {attend_phrase}, Days: {attend_days}"
-            if (attend_phrase or attend_days) else _DASH
+        # Attendance / Payroll / Compliance — day count only.
+        attend_disp = f"Days: {attend_days}" if attend_days else _DASH
+
+        # Happay & Conveyance — day count only.
+        happay_disp = f"Days: {happay_days}" if happay_days else _DASH
+
+        # MIS & Reports — day count only.
+        mis_disp = f"Days: {mis_days}" if mis_days else _DASH
+
+        # Other Work — condensed AI-style summary across all dates.  Wider
+        # budget so the cell shows representative phrases without being
+        # truncated mid-thought.
+        other_disp = _condense_summary(other_text, max_chars=220) if other_text else _DASH
+
+        # Subtotal = total DAYS the employee filed any HR activity in this
+        # range — consistent unit across all 6 metric columns.
+        row_subtotal = (
+            recruit_days + induct_days + exit_days
+            + attend_days + happay_days + mis_days
         )
-
-        # Happay & Conveyance — phrase total + day count.
-        happay_phrase = _sum_phrase_counts(happay_text, HAPPAY_KW)
-        happay_count = max(happay_phrase, happay_days)
-        happay_disp = (
-            f"Entries: {happay_phrase}, Days: {happay_days}"
-            if (happay_phrase or happay_days) else _DASH
-        )
-
-        # Other Work — condensed text (AI-style headline join).
-        other_disp = _condense_summary(other_text, max_chars=160) if other_text else _DASH
-
-        row_subtotal = recruit_count + induct_count + exit_count + attend_count + happay_count
 
         user_rows.append({
             "name": full_name,
-            "recruit_disp": recruit_disp, "recruit_count": recruit_count,
-            "induct_disp": induct_disp,   "induct_count": induct_count,
-            "exit_disp": exit_disp,       "exit_count": exit_count,
-            "attend_disp": attend_disp,   "attend_count": attend_count,
-            "happay_disp": happay_disp,   "happay_count": happay_count,
+            "recruit_disp": recruit_disp,
+            "induct_disp": induct_disp,
+            "exit_disp": exit_disp,
+            "attend_disp": attend_disp,
+            "happay_disp": happay_disp,
+            "mis_disp": mis_disp,
             "other_disp": other_disp,
             "subtotal": row_subtotal,
         })
@@ -1855,24 +2036,25 @@ def _build_hr_detail_sheet(ws, group, *, range_label: str):
              font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
         for col, key in [
             (3, "recruit_disp"), (4, "induct_disp"), (5, "exit_disp"),
-            (6, "attend_disp"), (7, "happay_disp"), (8, "other_disp"),
+            (6, "attend_disp"), (7, "happay_disp"), (8, "mis_disp"),
+            (9, "other_disp"),
         ]:
             txt = row[key]
             _put(ws, row_idx, col, txt,
                  font=_BODY_FONT if txt != _DASH else _MUTED_FONT,
                  fill=_ROW_FILL,
                  align=body_left if txt != _DASH else right_align)
-        _put(ws, row_idx, 9, row["subtotal"],
+        _put(ws, row_idx, 10, row["subtotal"],
              font=subtotal_bold, fill=_ROW_FILL, align=right_align)
         row_idx += 1
 
     if user_rows:
         _put(ws, row_idx, 2, "Total",
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=body_left)
-        # Text cols 3-8 stay blank in the total row.
-        for c in range(3, 9):
+        # Text cols 3-9 stay blank in the total row.
+        for c in range(3, 10):
             _put(ws, row_idx, c, "", fill=_TOTAL_FILL)
-        _put(ws, row_idx, 9,
+        _put(ws, row_idx, 10,
              sum(r["subtotal"] for r in user_rows),
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
 

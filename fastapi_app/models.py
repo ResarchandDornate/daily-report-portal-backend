@@ -230,6 +230,72 @@ class Organisation(Base):
         return f"<Organisation name={self.name!r}>"
 
 
+class Expense(Base):
+    """One expense claim submitted by an employee.
+
+    Bills (receipt images) live in MinIO under `minio_object_key`; this row
+    carries the metadata + the approval status.  Approval is decided by HR
+    (or by the dedicated approvers TARINI / SMITA — see routers/expenses.py).
+    """
+
+    __tablename__ = "expenses"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users_user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    date = Column(Date, nullable=False, index=True)
+    # Payment mode — Cash / UPI / Card / Bank Transfer / Other.
+    mode = Column(String(32), nullable=False, default="", server_default="")
+    # Expense category — material / food / travel / hotel / fuel / others.
+    expense_type = Column(String(32), nullable=False)
+    # Sub-type used only when expense_type == "travel"
+    # (bus / cab / bike / rapido / car / other).
+    travel_type = Column(String(32), nullable=False, default="", server_default="")
+    amount = Column(Integer, nullable=False, default=0, server_default="0")
+    remarks = Column(String(1024), nullable=False, default="", server_default="")
+    # Receipt files — JSONB list of `{"filename": str, "object_key": str}`.
+    # Empty list when no bills were attached.  Supports multiple uploads per
+    # expense (HR + employees both asked for this).
+    bills = Column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    # Approval lifecycle: pending → approved | rejected.
+    status = Column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    decided_by_id = Column(
+        BigInteger,
+        ForeignKey("users_user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+    decision_note = Column(
+        String(512), nullable=False, default="", server_default=""
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+    decided_by = relationship("User", foreign_keys=[decided_by_id])
+
+    __table_args__ = (
+        Index("ix_expenses_user_date", "user_id", "date"),
+        Index("ix_expenses_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Expense id={self.id} user_id={self.user_id} "
+            f"type={self.expense_type!r} amount={self.amount} "
+            f"status={self.status!r}>"
+        )
+
+
 class SalesUpload(Base):
     """One uploaded Excel sheet (weekly / monthly calling log).
 
