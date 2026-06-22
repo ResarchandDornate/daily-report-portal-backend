@@ -6,7 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from admin import setup_admin
 import model_events  # noqa: F401 -- registers SQLAlchemy event listeners on import
-from routers import auth, departments, organisations, reports, sales_uploads, users
+from routers import (
+    auth, departments, expenses, organisations, reports, sales_uploads, users,
+)
 
 app = FastAPI(
     title="Daily Report Portal API",
@@ -53,6 +55,7 @@ app.include_router(departments.router)
 app.include_router(organisations.router)
 app.include_router(reports.router)
 app.include_router(sales_uploads.router)
+app.include_router(expenses.router)
 
 
 # Mount SQLAdmin at /admin — authenticated via the same email/password as the

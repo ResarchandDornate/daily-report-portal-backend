@@ -195,5 +195,47 @@ class SalesUploadOut(BaseModel):
         from_attributes = True
 
 
+class ExpenseBillOut(BaseModel):
+    """One attached bill — `filename` is the original upload name, `index`
+    is the bill's position in the expense's `bills` list (used by the
+    `/api/expenses/{id}/bill/{index}` download endpoint).
+    """
+    index: int
+    filename: str
+
+
+class ExpenseOut(BaseModel):
+    """Single expense row — both employee-facing and admin-facing views use
+    this shape.  Bills are exposed via `bills[i].index` + download endpoint
+    rather than the raw MinIO key so the frontend doesn't see internals.
+    """
+    id: int
+    user_id: int
+    user_name: str = ""
+    user_department: str = ""
+    date: date
+    mode: str = ""
+    expense_type: str
+    travel_type: str = ""
+    amount: int
+    remarks: str = ""
+    bills: list[ExpenseBillOut] = []
+    status: str
+    decided_by_id: Optional[int] = None
+    decided_by_name: str = ""
+    decided_at: Optional[datetime] = None
+    decision_note: str = ""
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ExpenseDecideIn(BaseModel):
+    """Approval / rejection payload from the admin modal."""
+    decision: str  # "approved" | "rejected"
+    note: str = ""
+
+
 TokenResponse.model_rebuild()
 UserOut.model_rebuild()
