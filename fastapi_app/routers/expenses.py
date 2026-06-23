@@ -351,10 +351,10 @@ def decide_expense(
             "Only HR / approvers (TARINI, SMITA) can decide expenses.",
         )
     decision = (payload.decision or "").strip().lower()
-    if decision not in ("approved", "rejected"):
+    if decision not in ("approved", "rejected", "onhold"):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "decision must be 'approved' or 'rejected'",
+            "decision must be 'approved', 'rejected', or 'onhold'",
         )
     exp = db.query(Expense).filter(Expense.id == expense_id).first()
     if not exp:
