@@ -53,9 +53,10 @@ APPROVER_EMAILS = {
 # travel sub-types below.
 ALLOWED_EXPENSE_TYPES = {
     "material", "food", "travel", "hotel", "fuel", "others",
+    "officereimburse",
 }
 ALLOWED_TRAVEL_TYPES = {
-    "bus", "cab", "bike", "rapido", "car", "other",
+    "bus", "cab", "bike", "rapido", "car", "auto", "metro", "other",
 }
 ALLOWED_MODES = {"cash", "upi", "card", "bank", "other", ""}
 
