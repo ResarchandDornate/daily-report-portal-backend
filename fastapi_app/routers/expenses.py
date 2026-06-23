@@ -52,10 +52,13 @@ APPROVER_EMAILS = {
 # arbitrary values.  "travel" requires `travel_type` to also be one of the
 # travel sub-types below.
 ALLOWED_EXPENSE_TYPES = {
+    # Legacy values kept for backward-compat with existing rows ("material",
+    # "fuel") even though they're no longer in the dropdown.
     "material", "food", "travel", "hotel", "fuel", "others",
+    "officereimburse", "sitematerial", "officematerial",
 }
 ALLOWED_TRAVEL_TYPES = {
-    "bus", "cab", "bike", "rapido", "car", "other",
+    "bus", "cab", "bike", "rapido", "car", "auto", "metro", "other",
 }
 ALLOWED_MODES = {"cash", "upi", "card", "bank", "other", ""}
 
