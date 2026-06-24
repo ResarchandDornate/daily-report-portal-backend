@@ -51,6 +51,8 @@ class UserOut(BaseModel):
     organisation: str = ""
     reporting_manager: str = ""
     date_of_joining: Optional[date] = None
+    # Filled in when the user was deactivated (sent to "Employees Left").
+    date_of_leaving: Optional[date] = None
 
     class Config:
         from_attributes = True
@@ -133,6 +135,7 @@ class EmployeeUpdate(BaseModel):
     organisation: Optional[str] = None
     reporting_manager: Optional[str] = None
     date_of_joining: Optional[date] = None
+    date_of_leaving: Optional[date] = None
     is_active: Optional[bool] = None
     is_team_head: Optional[bool] = None
     # Slug of the department this team head manages (overrides their own dept).
@@ -232,9 +235,23 @@ class ExpenseOut(BaseModel):
 
 
 class ExpenseDecideIn(BaseModel):
-    """Approval / rejection payload from the admin modal."""
-    decision: str  # "approved" | "rejected"
+    """Approval / rejection / on-hold payload from the admin modal."""
+    decision: str  # "approved" | "rejected" | "onhold"
     note: str = ""
+
+
+class ExpensePatchIn(BaseModel):
+    """Owner-only edit payload — only used when the expense is still in
+    `pending` or `onhold` status.  Every field is optional; only the ones
+    that are non-None get applied.  Bills are managed via separate upload /
+    delete endpoints (left untouched on edit).
+    """
+    date: Optional[date] = None
+    mode: Optional[str] = None
+    expense_type: Optional[str] = None
+    travel_type: Optional[str] = None
+    amount: Optional[int] = None
+    remarks: Optional[str] = None
 
 
 TokenResponse.model_rebuild()

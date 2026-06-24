@@ -53,6 +53,22 @@ def _require_hr(user: User) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR can manage employees")
 
 
+# Named approver accounts (Tarini, Smita) are allowed to deactivate /
+# reactivate employees alongside HR.  Matched by the LOCAL PART of the
+# email (before "@") so `tarini.aggrawal@…` / `smita.s@…` etc. resolve too.
+_DEACT_APPROVER_PREFIXES = ("tarini", "smita")
+
+
+def _can_toggle_activation(user: User) -> bool:
+    if user.role == "hr":
+        return True
+    local = (user.email or "").strip().lower().split("@")[0]
+    return any(
+        local == p or local.startswith(p + ".") or local.startswith(p + "_")
+        for p in _DEACT_APPROVER_PREFIXES
+    )
+
+
 def _resolve_dept(db: Session, slug: str | None) -> Department | None:
     """Translate a department slug (or empty string / None) into a Department row.
 
@@ -127,14 +143,29 @@ def update_employee(
     db: Session = Depends(get_db),
     actor: User = Depends(get_current_user),
 ):
-    """HR-only: edit employee profile, move between departments, deactivate, etc."""
-    _require_hr(actor)
-
+    """HR can edit any field; Tarini / Smita can ONLY toggle `is_active`
+    (deactivate / reactivate employees).  Everything else stays HR-only.
+    """
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee not found")
 
     data = payload.model_dump(exclude_unset=True)
+
+    # Approvers (Tarini / Smita) can only flip is_active (and the matching
+    # date_of_leaving on the same request) — they're not HR.  Anything
+    # beyond that requires real HR rights.
+    if actor.role != "hr":
+        if not _can_toggle_activation(actor):
+            _require_hr(actor)  # raises 403
+        allowed_for_approver = {"is_active", "date_of_leaving"}
+        non_activation = {k for k in data.keys() if k not in allowed_for_approver}
+        if non_activation:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Only HR can edit employee details. "
+                "You can only deactivate / reactivate.",
+            )
 
     if "department" in data:
         dept = _resolve_dept(db, data.pop("department"))
@@ -162,8 +193,8 @@ def update_employee(
     # Whitelist of fields that map directly onto the column of the same name.
     for field in (
         "first_name", "last_name", "email", "title", "contact_number",
-        "organisation", "reporting_manager", "date_of_joining", "is_active",
-        "is_team_head",
+        "organisation", "reporting_manager", "date_of_joining",
+        "date_of_leaving", "is_active", "is_team_head",
     ):
         if field in data:
             value = data[field]

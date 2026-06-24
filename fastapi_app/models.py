@@ -143,6 +143,10 @@ class User(Base):
         String(128), nullable=False, default="", server_default=""
     )
     date_of_joining = Column(Date, nullable=True)
+    # Set when HR (or a named approver) deactivates the employee.  Cleared
+    # is intentional — re-activation does NOT auto-clear this field so HR
+    # keeps the audit trail if needed; they can clear it manually via Edit.
+    date_of_leaving = Column(Date, nullable=True)
 
     department = relationship(
         "Department",

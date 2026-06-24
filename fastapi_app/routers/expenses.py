@@ -36,7 +36,7 @@ import storage
 from auth import get_current_user
 from database import get_db
 from models import Expense, User
-from schemas import ExpenseBillOut, ExpenseDecideIn, ExpenseOut
+from schemas import ExpenseBillOut, ExpenseDecideIn, ExpenseOut, ExpensePatchIn
 
 
 router = APIRouter(prefix="/api/expenses", tags=["expenses"])
@@ -351,10 +351,10 @@ def decide_expense(
             "Only HR / approvers (TARINI, SMITA) can decide expenses.",
         )
     decision = (payload.decision or "").strip().lower()
-    if decision not in ("approved", "rejected"):
+    if decision not in ("approved", "rejected", "onhold"):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "decision must be 'approved' or 'rejected'",
+            "decision must be 'approved', 'rejected', or 'onhold'",
         )
     exp = db.query(Expense).filter(Expense.id == expense_id).first()
     if not exp:
@@ -363,6 +363,83 @@ def decide_expense(
     exp.decided_by_id = user.id
     exp.decided_at = datetime.now(timezone.utc)
     exp.decision_note = (payload.note or "").strip()
+    db.commit()
+    db.refresh(exp)
+    return _to_out(exp)
+
+
+@router.patch("/{expense_id}", response_model=ExpenseOut)
+def update_expense(
+    expense_id: int,
+    payload: ExpensePatchIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Owner edits their own expense.  Only allowed while the expense is
+    still pending or on hold; once approved / rejected the row is locked.
+
+    Bills attached to the expense are NOT touched here — bill add/remove
+    flows go through the upload + delete endpoints.
+    """
+    exp = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not exp:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+    if exp.user_id != user.id and not _is_hr(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You can only edit your own expenses (HR can edit any).",
+        )
+    if exp.status not in ("pending", "onhold"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This expense has already been decided and can no longer be edited.",
+        )
+
+    # Apply each provided field with the same validation rules as create.
+    if payload.date is not None:
+        exp.date = payload.date
+    if payload.mode is not None:
+        m = (payload.mode or "").strip().lower()
+        if m and m not in ALLOWED_MODES:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Invalid mode. Allowed: {sorted(ALLOWED_MODES - {''})}",
+            )
+        exp.mode = m
+    if payload.expense_type is not None:
+        et = (payload.expense_type or "").strip().lower()
+        if et not in ALLOWED_EXPENSE_TYPES:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Invalid expense_type. Allowed: {sorted(ALLOWED_EXPENSE_TYPES)}",
+            )
+        exp.expense_type = et
+    if payload.travel_type is not None:
+        tt = (payload.travel_type or "").strip().lower()
+        if tt and tt not in ALLOWED_TRAVEL_TYPES:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Invalid travel_type. Allowed: {sorted(ALLOWED_TRAVEL_TYPES)}",
+            )
+        exp.travel_type = tt
+    if payload.amount is not None:
+        if payload.amount < 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "amount must be a non-negative integer",
+            )
+        exp.amount = payload.amount
+    if payload.remarks is not None:
+        exp.remarks = (payload.remarks or "").strip()
+
+    # Editing an on-hold expense bumps it back to pending so the approver
+    # sees a fresh request to review.  Reset the prior decision metadata too.
+    if exp.status == "onhold":
+        exp.status = "pending"
+        exp.decided_by_id = None
+        exp.decided_at = None
+        exp.decision_note = ""
+
     db.commit()
     db.refresh(exp)
     return _to_out(exp)
