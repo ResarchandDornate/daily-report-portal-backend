@@ -40,6 +40,11 @@ class UserOut(BaseModel):
     role: str
     title: str
     contact_number: str
+    # Activation flag — drives the "Employees Left" filter on the frontend.
+    # Was missing from this schema until 2026-06-24; without it, every user
+    # came back to the UI looking active and the Employees Left page was
+    # permanently empty.
+    is_active: bool = True
     department: Optional["DepartmentOut"] = None
     is_team_head: bool = False
     # The department slug this team head manages, if it overrides their own.
