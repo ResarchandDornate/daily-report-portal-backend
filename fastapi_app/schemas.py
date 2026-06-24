@@ -51,6 +51,8 @@ class UserOut(BaseModel):
     organisation: str = ""
     reporting_manager: str = ""
     date_of_joining: Optional[date] = None
+    # Filled in when the user was deactivated (sent to "Employees Left").
+    date_of_leaving: Optional[date] = None
 
     class Config:
         from_attributes = True
@@ -133,6 +135,7 @@ class EmployeeUpdate(BaseModel):
     organisation: Optional[str] = None
     reporting_manager: Optional[str] = None
     date_of_joining: Optional[date] = None
+    date_of_leaving: Optional[date] = None
     is_active: Optional[bool] = None
     is_team_head: Optional[bool] = None
     # Slug of the department this team head manages (overrides their own dept).
