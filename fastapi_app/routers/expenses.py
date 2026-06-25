@@ -122,6 +122,7 @@ def _to_out(exp: Expense) -> ExpenseOut:
         expense_type=exp.expense_type,
         travel_type=exp.travel_type or "",
         amount=exp.amount or 0,
+        advance=exp.advance or 0,
         remarks=exp.remarks or "",
         bills=bills_out,
         status=exp.status,
@@ -140,6 +141,7 @@ async def create_expense(
     expense_type: str = Form(...),
     travel_type: str = Form(""),
     amount: int = Form(...),
+    advance: int = Form(0),
     remarks: str = Form(""),
     # Multi-file: the browser sends one `bills` form field per file.  Single
     # files still work (the list arrives with one element).  We also accept
@@ -246,6 +248,7 @@ async def create_expense(
         expense_type=expense_type,
         travel_type=travel_type,
         amount=amount,
+        advance=max(0, int(advance or 0)),
         remarks=(remarks or "").strip(),
         bills=stored_bills,
         status="pending",
@@ -435,6 +438,13 @@ def update_expense(
                 "amount must be a non-negative integer",
             )
         exp.amount = payload.amount
+    if payload.advance is not None:
+        if payload.advance < 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "advance must be a non-negative integer",
+            )
+        exp.advance = payload.advance
     if payload.remarks is not None:
         exp.remarks = (payload.remarks or "").strip()
 
