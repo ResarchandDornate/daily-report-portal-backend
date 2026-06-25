@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 import storage
 from auth import get_current_user
 from database import get_db
-from models import Expense, User
+from models import Expense, MonthlyExpenseNote, User
 from schemas import ExpenseBillOut, ExpenseDecideIn, ExpenseOut, ExpensePatchIn
 
 
@@ -690,3 +690,117 @@ def monthly_summary_xlsx(
             "Content-Length": str(len(payload_bytes)),
         },
     )
+
+
+# ============================================================
+# Monthly-summary notes (advance + remark per user × month)
+# ============================================================
+
+def _note_to_dict(n: MonthlyExpenseNote) -> dict:
+    return {
+        "user_id": n.user_id,
+        "year": n.year,
+        "month": n.month,
+        "advance": n.advance or 0,
+        "remark": n.remark or "",
+        "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+    }
+
+
+@router.get("/monthly-notes")
+def list_monthly_notes(
+    year: int = Query(...),
+    month: int = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """List monthly notes for a (year, month).
+
+    Approvers (HR / Tarini / Smita) see EVERY employee's notes for the
+    period.  Regular employees see only their own row — so they can read
+    the HR remark for the current month on their own expense view.
+    """
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid year/month: {year}/{month}",
+        )
+    q = db.query(MonthlyExpenseNote).filter(
+        MonthlyExpenseNote.year == year,
+        MonthlyExpenseNote.month == month,
+    )
+    if not _is_approver(user):
+        q = q.filter(MonthlyExpenseNote.user_id == user.id)
+    rows = q.all()
+    return {"items": [_note_to_dict(r) for r in rows]}
+
+
+@router.put("/monthly-notes")
+def upsert_monthly_note(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """HR-only: create or update a (user, year, month) note.
+
+    Body shape:
+        { "user_id": 17, "year": 2026, "month": 6,
+          "advance": 500, "remark": "On hold — awaiting director approval" }
+
+    Either `advance` or `remark` is optional but at least one should be
+    sent (sending both is fine).  Missing means "leave that field as-is".
+    """
+    if not _is_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only HR / approvers can edit monthly notes.",
+        )
+    try:
+        target_user_id = int(payload.get("user_id"))
+        year = int(payload.get("year"))
+        month = int(payload.get("month"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "user_id, year, and month are required integers.",
+        )
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid year/month: {year}/{month}",
+        )
+
+    # Find or create the note row.
+    note = (
+        db.query(MonthlyExpenseNote)
+        .filter(
+            MonthlyExpenseNote.user_id == target_user_id,
+            MonthlyExpenseNote.year == year,
+            MonthlyExpenseNote.month == month,
+        )
+        .first()
+    )
+    if note is None:
+        note = MonthlyExpenseNote(
+            user_id=target_user_id,
+            year=year,
+            month=month,
+            advance=0,
+            remark="",
+        )
+        db.add(note)
+
+    if "advance" in payload and payload["advance"] is not None:
+        try:
+            adv = max(0, int(float(payload["advance"])))
+        except (TypeError, ValueError):
+            adv = 0
+        note.advance = adv
+    if "remark" in payload and payload["remark"] is not None:
+        note.remark = str(payload["remark"])[:2048]
+    note.updated_by_id = user.id
+
+    db.commit()
+    db.refresh(note)
+    return _note_to_dict(note)
+
