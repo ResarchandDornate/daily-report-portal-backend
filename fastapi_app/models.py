@@ -303,6 +303,57 @@ class Expense(Base):
         )
 
 
+class MonthlyExpenseNote(Base):
+    """HR's per-employee, per-month advance + remarks for the Expense
+    Monthly Summary modal.  One row per (user_id, year, month).
+
+    `advance` mirrors what HR types in the inline number input.
+    `remark` is the explanation HR shows the employee when payment is on
+    hold for the month (e.g. "Awaiting Director approval, paying next
+    cycle").  The employee sees this on their own My Expenses view.
+    """
+
+    __tablename__ = "monthly_expense_notes"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(
+        BigInteger,
+        ForeignKey("users_user.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)  # 1..12
+    advance = Column(Integer, nullable=False, default=0, server_default="0")
+    remark = Column(String(2048), nullable=False, default="", server_default="")
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    updated_by_id = Column(
+        BigInteger,
+        ForeignKey("users_user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    user = relationship("User", foreign_keys=[user_id])
+    updated_by = relationship("User", foreign_keys=[updated_by_id])
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "year", "month", name="uq_monthly_expense_notes_user_period"
+        ),
+        Index("ix_monthly_expense_notes_period", "year", "month"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<MonthlyExpenseNote id={self.id} user_id={self.user_id} "
+            f"{self.year}-{self.month:02d} advance={self.advance}>"
+        )
+
+
 class SalesUpload(Base):
     """One uploaded Excel sheet (weekly / monthly calling log).
 
