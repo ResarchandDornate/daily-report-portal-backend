@@ -16,20 +16,26 @@ Bills live in MinIO under `expenses/{uuid}.{ext}` in the existing bucket.
 """
 from __future__ import annotations
 
+import io
 import uuid
-from datetime import date as date_type, datetime, timezone
+from datetime import date as date_type, datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
     HTTPException,
+    Query,
     Response,
     UploadFile,
     status,
 )
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from sqlalchemy.orm import Session
 
 import storage
@@ -473,3 +479,204 @@ def delete_expense(
     db.delete(exp)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ============================================================
+# Monthly summary Excel export
+# ============================================================
+
+def _month_bounds(year: int, month: int) -> tuple[date_type, date_type]:
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid year/month: {year}/{month}",
+        )
+    first = date_type(year, month, 1)
+    last = (
+        date_type(year + 1, 1, 1) if month == 12 else date_type(year, month + 1, 1)
+    ) - timedelta(days=1)
+    return first, last
+
+
+@router.post("/monthly-summary.xlsx")
+def monthly_summary_xlsx(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """One-tab Excel of monthly expense summary per employee.
+
+    Body shape:
+        {
+          "year": 2026,
+          "month": 6,                  # 1..12
+          "advances": { "<user_id>": 500, ... }   # optional advance per emp
+        }
+
+    Columns:
+        Employee | Total Amount | Status | Advance | Subtotal | Submit Date
+
+    Footer row: Total Amount  ·  Total Advance  ·  Subtotal.
+
+    Restricted to HR + named approvers (Tarini / Smita).
+    """
+    if not _is_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only HR / approvers can download the monthly summary.",
+        )
+    year = int(payload.get("year") or 0)
+    month = int(payload.get("month") or 0)
+    advances_in = payload.get("advances") or {}
+    if not isinstance(advances_in, dict):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "`advances` must be an object"
+        )
+    advances: dict[int, int] = {}
+    for k, v in advances_in.items():
+        try:
+            advances[int(k)] = int(float(v or 0))
+        except (TypeError, ValueError):
+            continue
+
+    first, last = _month_bounds(year, month)
+
+    # All expenses in the month (any status).
+    rows = (
+        db.query(Expense)
+        .join(User, Expense.user_id == User.id)
+        .filter(Expense.date >= first, Expense.date <= last)
+        .order_by(User.first_name, Expense.created_at)
+        .all()
+    )
+
+    # Group by user_id.
+    by_user: dict[int, dict] = {}
+    for r in rows:
+        u = r.user
+        full_name = _full_name(u) or "—"
+        g = by_user.setdefault(r.user_id, {
+            "name": full_name,
+            "total": 0,
+            "pending": 0,
+            "approved": 0,
+            "rejected": 0,
+            "onhold": 0,
+            "latest_submit": r.created_at,
+        })
+        g["total"] += (r.amount or 0)
+        if r.status in g:
+            g[r.status] += 1
+        if r.created_at and (g["latest_submit"] is None or r.created_at > g["latest_submit"]):
+            g["latest_submit"] = r.created_at
+
+    # ---- Build the workbook ----
+    wb = Workbook()
+    ws = wb.active
+    month_label = first.strftime("%B %Y")  # e.g. "June 2026"
+    ws.title = f"Expenses {first.strftime('%b %Y')}"[:31]
+
+    title_font = Font(bold=True, size=14, color="1B5E8B")
+    subtitle_font = Font(size=10, color="666666", italic=True)
+    header_font = Font(bold=True, size=10, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1A2A3A")
+    total_font = Font(bold=True, size=10, color="1B5E8B")
+    total_fill = PatternFill("solid", fgColor="EAF1F8")
+    body_font = Font(size=10, color="1A1A1A")
+    border = Border(*[Side(style="thin", color="C9D2DC")] * 4)
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    ws["B1"] = f"Monthly Expense Summary — {month_label}"
+    ws["B1"].font = title_font
+    ws.merge_cells("B1:G1")
+    ws["B2"] = (
+        f"{len(by_user)} employee{'s' if len(by_user) != 1 else ''}"
+        f"  ·  {len(rows)} expense{'s' if len(rows) != 1 else ''}"
+        f"  ·  Generated: {date_type.today().strftime('%d %b %Y')}"
+    )
+    ws["B2"].font = subtitle_font
+    ws.merge_cells("B2:G2")
+
+    headers = ["Employee", "Total Amount", "Status", "Advance", "Subtotal", "Submit Date"]
+    widths = [28, 18, 22, 14, 16, 18]
+    ws.column_dimensions["A"].width = 3
+    for i, (h, w) in enumerate(zip(headers, widths), start=2):
+        c = ws.cell(row=4, column=i, value=h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center
+        c.border = border
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[4].height = 24
+
+    sorted_groups = sorted(by_user.items(), key=lambda kv: kv[1]["name"].lower())
+
+    total_amount_sum = 0
+    total_advance_sum = 0
+    total_subtotal_sum = 0
+    row_idx = 5
+    for uid, g in sorted_groups:
+        amt = g["total"]
+        adv = advances.get(uid, 0)
+        sub = amt - adv
+        total_amount_sum += amt
+        total_advance_sum += adv
+        total_subtotal_sum += sub
+        status_bits = []
+        if g["pending"]:  status_bits.append(f"Pending: {g['pending']}")
+        if g["onhold"]:   status_bits.append(f"On Hold: {g['onhold']}")
+        if g["approved"]: status_bits.append(f"Approved: {g['approved']}")
+        if g["rejected"]: status_bits.append(f"Rejected: {g['rejected']}")
+        status_text = ", ".join(status_bits) or "—"
+        submit_str = (
+            g["latest_submit"].strftime("%d %b %Y")
+            if g["latest_submit"] else "—"
+        )
+
+        cells = [
+            (g["name"], left),
+            (f"₹{amt:,.0f}", right),
+            (status_text, left),
+            (f"₹{adv:,.0f}", right),
+            (f"₹{sub:,.0f}", right),
+            (submit_str, center),
+        ]
+        for col_offset, (val, align) in enumerate(cells):
+            c = ws.cell(row=row_idx, column=2 + col_offset, value=val)
+            c.font = body_font
+            c.alignment = align
+            c.border = border
+        row_idx += 1
+
+    # Footer totals row.
+    if sorted_groups:
+        ws.cell(row=row_idx, column=2, value="Total")
+        ws.cell(row=row_idx, column=3, value=f"₹{total_amount_sum:,.0f}")
+        ws.cell(row=row_idx, column=4, value="")
+        ws.cell(row=row_idx, column=5, value=f"₹{total_advance_sum:,.0f}")
+        ws.cell(row=row_idx, column=6, value=f"₹{total_subtotal_sum:,.0f}")
+        ws.cell(row=row_idx, column=7, value="")
+        for col in range(2, 8):
+            c = ws.cell(row=row_idx, column=col)
+            c.font = total_font
+            c.fill = total_fill
+            c.border = border
+            c.alignment = right if col in (3, 5, 6) else left
+
+    # Stream the file out.
+    buf = io.BytesIO()
+    wb.save(buf)
+    payload_bytes = buf.getvalue()
+    filename = f"monthly-expenses-{first.strftime('%Y-%m')}.xlsx"
+    return Response(
+        content=payload_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload_bytes)),
+        },
+    )
