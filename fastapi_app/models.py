@@ -260,6 +260,9 @@ class Expense(Base):
     # (bus / cab / bike / rapido / car / other).
     travel_type = Column(String(32), nullable=False, default="", server_default="")
     amount = Column(Integer, nullable=False, default=0, server_default="0")
+    # Advance already paid by HR to the employee against this expense.  The
+    # net reimbursement owed is `amount - advance` (the subtotal column).
+    advance = Column(Integer, nullable=False, default=0, server_default="0")
     remarks = Column(String(1024), nullable=False, default="", server_default="")
     # Receipt files — JSONB list of `{"filename": str, "object_key": str}`.
     # Empty list when no bills were attached.  Supports multiple uploads per

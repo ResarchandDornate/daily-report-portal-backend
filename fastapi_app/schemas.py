@@ -226,6 +226,9 @@ class ExpenseOut(BaseModel):
     expense_type: str
     travel_type: str = ""
     amount: int
+    # Advance HR paid against this expense (default 0).  Subtotal owed to
+    # the employee = amount - advance.
+    advance: int = 0
     remarks: str = ""
     bills: list[ExpenseBillOut] = []
     status: str
@@ -256,6 +259,7 @@ class ExpensePatchIn(BaseModel):
     expense_type: Optional[str] = None
     travel_type: Optional[str] = None
     amount: Optional[int] = None
+    advance: Optional[int] = None
     remarks: Optional[str] = None
 
 
