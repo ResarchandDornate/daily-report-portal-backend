@@ -123,6 +123,7 @@ def _to_out(exp: Expense) -> ExpenseOut:
         travel_type=exp.travel_type or "",
         amount=exp.amount or 0,
         advance=exp.advance or 0,
+        site_name=exp.site_name or "",
         remarks=exp.remarks or "",
         bills=bills_out,
         status=exp.status,
@@ -142,6 +143,7 @@ async def create_expense(
     travel_type: str = Form(""),
     amount: int = Form(...),
     advance: int = Form(0),
+    site_name: str = Form(""),
     remarks: str = Form(""),
     # Multi-file: the browser sends one `bills` form field per file.  Single
     # files still work (the list arrives with one element).  We also accept
@@ -249,6 +251,7 @@ async def create_expense(
         travel_type=travel_type,
         amount=amount,
         advance=max(0, int(advance or 0)),
+        site_name=(site_name or "").strip()[:255],
         remarks=(remarks or "").strip(),
         bills=stored_bills,
         status="pending",
@@ -445,6 +448,8 @@ def update_expense(
                 "advance must be a non-negative integer",
             )
         exp.advance = payload.advance
+    if payload.site_name is not None:
+        exp.site_name = (payload.site_name or "").strip()[:255]
     if payload.remarks is not None:
         exp.remarks = (payload.remarks or "").strip()
 
@@ -692,6 +697,296 @@ def monthly_summary_xlsx(
     )
 
 
+@router.post("/department-summary.xlsx")
+def department_summary_xlsx(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Multi-sheet Excel of monthly expenses, with an Overview tab + one
+    tab per department.
+
+    Body shape:
+        { "year": 2026, "month": 6 }
+
+    Overview sheet:
+        - Grand total across the company
+        - Per-department breakdown: department, # employees, # expenses, total
+        - Per-employee summary: name, department, total, status mix, last submit
+
+    One sheet per department (only departments that have expenses in the
+    period):
+        - Every individual expense as a row:
+          Date | Employee | Type | Mode | Amount | Status | Submit Date | Remarks
+
+    Restricted to HR + named approvers (Tarini / Smita).
+    """
+    if not _is_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only HR / approvers can download the department summary.",
+        )
+    year = int(payload.get("year") or 0)
+    month = int(payload.get("month") or 0)
+    first, last = _month_bounds(year, month)
+
+    rows = (
+        db.query(Expense)
+        .join(User, Expense.user_id == User.id)
+        .filter(Expense.date >= first, Expense.date <= last)
+        .order_by(User.first_name, Expense.date)
+        .all()
+    )
+
+    UNASSIGNED = "Unassigned"
+    by_dept: dict[str, list[Expense]] = {}
+    employees_per_dept: dict[str, set[int]] = {}
+    employee_totals: dict[int, dict] = {}
+    grand_total = 0
+
+    for r in rows:
+        dept = _dept_name(r.user) or UNASSIGNED
+        by_dept.setdefault(dept, []).append(r)
+        employees_per_dept.setdefault(dept, set()).add(r.user_id)
+        grand_total += (r.amount or 0)
+
+        g = employee_totals.setdefault(r.user_id, {
+            "name": _full_name(r.user) or "—",
+            "dept": dept,
+            "total": 0,
+            "pending": 0,
+            "approved": 0,
+            "rejected": 0,
+            "onhold": 0,
+            "latest_submit": r.created_at,
+        })
+        g["total"] += (r.amount or 0)
+        if r.status in g:
+            g[r.status] += 1
+        if r.created_at and (g["latest_submit"] is None or r.created_at > g["latest_submit"]):
+            g["latest_submit"] = r.created_at
+
+    # ---- Shared styles ----
+    title_font = Font(bold=True, size=14, color="1B5E8B")
+    subtitle_font = Font(size=10, color="666666", italic=True)
+    header_font = Font(bold=True, size=10, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1A2A3A")
+    total_font = Font(bold=True, size=10, color="1B5E8B")
+    total_fill = PatternFill("solid", fgColor="EAF1F8")
+    section_font = Font(bold=True, size=11, color="1A1A1A")
+    body_font = Font(size=10, color="1A1A1A")
+    border = Border(*[Side(style="thin", color="C9D2DC")] * 4)
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    wb = Workbook()
+    overview = wb.active
+    month_label = first.strftime("%B %Y")
+    overview.title = "Overview"
+
+    overview["B1"] = f"Expense Summary — {month_label}"
+    overview["B1"].font = title_font
+    overview.merge_cells("B1:F1")
+    overview["B2"] = (
+        f"Total Expense: ₹{grand_total:,.0f}"
+        f"  ·  {len(employee_totals)} employee{'s' if len(employee_totals) != 1 else ''}"
+        f"  ·  {len(by_dept)} department{'s' if len(by_dept) != 1 else ''}"
+        f"  ·  {len(rows)} expense{'s' if len(rows) != 1 else ''}"
+        f"  ·  Generated: {date_type.today().strftime('%d %b %Y')}"
+    )
+    overview["B2"].font = subtitle_font
+    overview.merge_cells("B2:F2")
+    overview.column_dimensions["A"].width = 3
+
+    # Section 1 — per-department breakdown.
+    overview["B4"] = "By Department"
+    overview["B4"].font = section_font
+
+    dept_headers = ["Department", "Employees", "Expenses", "Total Amount"]
+    dept_widths = [28, 14, 14, 18]
+    for i, (h, w) in enumerate(zip(dept_headers, dept_widths), start=2):
+        c = overview.cell(row=5, column=i, value=h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center
+        c.border = border
+        overview.column_dimensions[get_column_letter(i)].width = w
+    overview.row_dimensions[5].height = 22
+
+    dept_sorted = sorted(by_dept.keys(), key=lambda n: n.lower())
+    row_idx = 6
+    dept_total_sum = 0
+    for dept in dept_sorted:
+        exps = by_dept[dept]
+        dept_total = sum((e.amount or 0) for e in exps)
+        dept_total_sum += dept_total
+        cells = [
+            (dept, left),
+            (len(employees_per_dept[dept]), center),
+            (len(exps), center),
+            (f"₹{dept_total:,.0f}", right),
+        ]
+        for col_offset, (val, align) in enumerate(cells):
+            c = overview.cell(row=row_idx, column=2 + col_offset, value=val)
+            c.font = body_font
+            c.alignment = align
+            c.border = border
+        row_idx += 1
+
+    if dept_sorted:
+        overview.cell(row=row_idx, column=2, value="Total")
+        overview.cell(row=row_idx, column=3, value=len(employee_totals))
+        overview.cell(row=row_idx, column=4, value=len(rows))
+        overview.cell(row=row_idx, column=5, value=f"₹{dept_total_sum:,.0f}")
+        for col in range(2, 6):
+            c = overview.cell(row=row_idx, column=col)
+            c.font = total_font
+            c.fill = total_fill
+            c.border = border
+            c.alignment = right if col in (3, 4, 5) else left
+        row_idx += 2
+
+    # Section 2 — per-employee summary (all employees, all departments).
+    overview.cell(row=row_idx, column=2, value="By Employee").font = section_font
+    row_idx += 1
+
+    emp_headers = ["Employee", "Department", "Total Amount", "Status", "Last Submit"]
+    emp_widths = [24, 22, 16, 26, 18]
+    for i, (h, w) in enumerate(zip(emp_headers, emp_widths), start=2):
+        c = overview.cell(row=row_idx, column=i, value=h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center
+        c.border = border
+        # Don't shrink columns already wider from the dept table above.
+        cur_w = overview.column_dimensions[get_column_letter(i)].width or 0
+        if w > cur_w:
+            overview.column_dimensions[get_column_letter(i)].width = w
+    overview.row_dimensions[row_idx].height = 22
+    row_idx += 1
+
+    emp_sorted = sorted(
+        employee_totals.items(),
+        key=lambda kv: (kv[1]["dept"].lower(), kv[1]["name"].lower()),
+    )
+    for _uid, g in emp_sorted:
+        status_bits = []
+        if g["pending"]:  status_bits.append(f"P: {g['pending']}")
+        if g["onhold"]:   status_bits.append(f"H: {g['onhold']}")
+        if g["approved"]: status_bits.append(f"A: {g['approved']}")
+        if g["rejected"]: status_bits.append(f"R: {g['rejected']}")
+        cells = [
+            (g["name"], left),
+            (g["dept"], left),
+            (f"₹{g['total']:,.0f}", right),
+            (", ".join(status_bits) or "—", left),
+            (g["latest_submit"].strftime("%d %b %Y") if g["latest_submit"] else "—", center),
+        ]
+        for col_offset, (val, align) in enumerate(cells):
+            c = overview.cell(row=row_idx, column=2 + col_offset, value=val)
+            c.font = body_font
+            c.alignment = align
+            c.border = border
+        row_idx += 1
+
+    # ---- Per-department sheets (only depts with expenses). ----
+    used_titles: set[str] = {"Overview"}
+    for dept in dept_sorted:
+        # Sheet titles capped at 31 chars by Excel; sanitize illegal chars.
+        clean = "".join(ch for ch in dept if ch not in r":\/?*[]") or "Dept"
+        title = clean[:31] or "Dept"
+        base = title
+        suffix = 2
+        while title in used_titles:
+            tail = f"-{suffix}"
+            title = (base[: 31 - len(tail)]) + tail
+            suffix += 1
+        used_titles.add(title)
+
+        ws = wb.create_sheet(title=title)
+        dept_total = sum((e.amount or 0) for e in by_dept[dept])
+        ws["B1"] = f"{dept} — {month_label}"
+        ws["B1"].font = title_font
+        ws.merge_cells("B1:J1")
+        ws["B2"] = (
+            f"Total: ₹{dept_total:,.0f}"
+            f"  ·  {len(employees_per_dept[dept])} employee{'s' if len(employees_per_dept[dept]) != 1 else ''}"
+            f"  ·  {len(by_dept[dept])} expense{'s' if len(by_dept[dept]) != 1 else ''}"
+        )
+        ws["B2"].font = subtitle_font
+        ws.merge_cells("B2:J2")
+        ws.column_dimensions["A"].width = 3
+
+        headers = [
+            "Date", "Employee", "Site", "Type", "Mode",
+            "Amount", "Status", "Submit Date", "Remarks",
+        ]
+        widths = [12, 22, 22, 16, 10, 14, 12, 14, 40]
+        for i, (h, w) in enumerate(zip(headers, widths), start=2):
+            c = ws.cell(row=4, column=i, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = border
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.row_dimensions[4].height = 24
+
+        sorted_exps = sorted(
+            by_dept[dept],
+            key=lambda e: (_full_name(e.user).lower(), e.date or date_type.min),
+        )
+        r_idx = 5
+        for e in sorted_exps:
+            etype = e.expense_type or ""
+            if e.travel_type:
+                etype = f"{etype} ({e.travel_type})" if etype else e.travel_type
+            cells = [
+                (e.date.strftime("%d %b %Y") if e.date else "—", center),
+                (_full_name(e.user) or "—", left),
+                (e.site_name or "—", left),
+                (etype or "—", left),
+                ((e.mode or "—"), left),
+                (f"₹{(e.amount or 0):,.0f}", right),
+                ((e.status or "").capitalize() or "—", left),
+                (e.created_at.strftime("%d %b %Y") if e.created_at else "—", center),
+                (e.remarks or "", left),
+            ]
+            for col_offset, (val, align) in enumerate(cells):
+                c = ws.cell(row=r_idx, column=2 + col_offset, value=val)
+                c.font = body_font
+                c.alignment = align
+                c.border = border
+            r_idx += 1
+
+        # Footer total row for the department.  Amount column shifted to
+        # col 7 after inserting Site between Employee and Type.
+        if sorted_exps:
+            ws.cell(row=r_idx, column=2, value="Total")
+            ws.cell(row=r_idx, column=7, value=f"₹{dept_total:,.0f}")
+            for col in range(2, 11):
+                c = ws.cell(row=r_idx, column=col)
+                c.font = total_font
+                c.fill = total_fill
+                c.border = border
+                c.alignment = right if col == 7 else left
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    payload_bytes = buf.getvalue()
+    filename = f"expense-departments-{first.strftime('%Y-%m')}.xlsx"
+    return Response(
+        content=payload_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(payload_bytes)),
+        },
+    )
+
+
 # ============================================================
 # Monthly-summary notes (advance + remark per user × month)
 # ============================================================
@@ -733,6 +1028,45 @@ def list_monthly_notes(
         q = q.filter(MonthlyExpenseNote.user_id == user.id)
     rows = q.all()
     return {"items": [_note_to_dict(r) for r in rows]}
+
+
+@router.get("/advances")
+def list_advances(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Approver-only: every advance ever recorded, newest first.
+
+    Returns a flat list of `{ user_id, user_name, department, year, month,
+    advance, updated_at }` — only rows where advance > 0.  Used by the
+    Expense page's "Advances" panel.
+    """
+    if not _is_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only HR / approvers can view the advances list.",
+        )
+    rows = (
+        db.query(MonthlyExpenseNote)
+        .join(User, MonthlyExpenseNote.user_id == User.id)
+        .filter(MonthlyExpenseNote.advance > 0)
+        .order_by(MonthlyExpenseNote.updated_at.desc())
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "user_id": n.user_id,
+                "user_name": _full_name(n.user) or "—",
+                "department": _dept_name(n.user) or "",
+                "year": n.year,
+                "month": n.month,
+                "advance": n.advance or 0,
+                "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+            }
+            for n in rows
+        ]
+    }
 
 
 @router.put("/monthly-notes")

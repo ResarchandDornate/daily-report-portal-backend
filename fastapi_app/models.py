@@ -263,6 +263,9 @@ class Expense(Base):
     # Advance already paid by HR to the employee against this expense.  The
     # net reimbursement owed is `amount - advance` (the subtotal column).
     advance = Column(Integer, nullable=False, default=0, server_default="0")
+    # Optional free-text label tying the expense to a specific site / project
+    # / customer location (e.g. "Nhava Sheva WH", "Okhla Custom House").
+    site_name = Column(String(255), nullable=False, default="", server_default="")
     remarks = Column(String(1024), nullable=False, default="", server_default="")
     # Receipt files — JSONB list of `{"filename": str, "object_key": str}`.
     # Empty list when no bills were attached.  Supports multiple uploads per
