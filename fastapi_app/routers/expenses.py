@@ -496,6 +496,143 @@ def delete_expense(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+def _assert_can_edit_bills(exp: Expense, user: User) -> None:
+    """Same gate as PATCH /expenses/{id} — owner or HR, status pending/onhold."""
+    if exp.user_id != user.id and not _is_hr(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You can only manage bills on your own expenses (HR can edit any).",
+        )
+    if exp.status not in ("pending", "onhold"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This expense has already been decided and its bills are locked.",
+        )
+
+
+@router.post("/{expense_id}/bills", response_model=ExpenseOut)
+async def add_bills(
+    expense_id: int,
+    bills: list[UploadFile] = File(default=[]),
+    bill: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Append one or more bill files to an existing pending/onhold expense.
+
+    Mirrors the validation in `create_expense` — same extensions, mime
+    types, size cap, and the per-expense max of 10 bills.
+    """
+    exp = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not exp:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+    _assert_can_edit_bills(exp, user)
+
+    incoming: list[UploadFile] = []
+    for f in (bills or []):
+        if f and f.filename:
+            incoming.append(f)
+    if bill and bill.filename:
+        incoming.append(bill)
+    if not incoming:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "No bill files were uploaded.",
+        )
+
+    existing = list(exp.bills or [])
+    if len(existing) + len(incoming) > MAX_BILLS_PER_EXPENSE:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"At most {MAX_BILLS_PER_EXPENSE} bills can be attached "
+            f"({len(existing)} already attached).",
+        )
+
+    stored_new: list[dict] = []
+    for f in incoming:
+        suffix = Path(f.filename).suffix.lower()
+        if suffix not in ALLOWED_BILL_EXTENSIONS:
+            for prior in stored_new:
+                try: storage.delete_object(prior["object_key"])
+                except Exception: pass
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Bill {f.filename!r}: must be one of {sorted(ALLOWED_BILL_EXTENSIONS)}",
+            )
+        content_type = (f.content_type or "").lower()
+        if content_type and content_type not in ALLOWED_BILL_MIMETYPES:
+            for prior in stored_new:
+                try: storage.delete_object(prior["object_key"])
+                except Exception: pass
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Bill {f.filename!r}: content-type {content_type!r} not allowed.",
+            )
+        data = await f.read()
+        if len(data) > MAX_BILL_BYTES:
+            for prior in stored_new:
+                try: storage.delete_object(prior["object_key"])
+                except Exception: pass
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Bill {f.filename!r}: exceeds {MAX_BILL_BYTES // (1024 * 1024)} MB limit.",
+            )
+        object_key = f"expenses/{uuid.uuid4().hex}{suffix}"
+        try:
+            storage.put_object(
+                object_key,
+                data,
+                content_type=content_type or "application/octet-stream",
+            )
+        except Exception as e:
+            for prior in stored_new:
+                try: storage.delete_object(prior["object_key"])
+                except Exception: pass
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"Could not store bill {f.filename!r}: {e}",
+            )
+        stored_new.append({"filename": f.filename, "object_key": object_key})
+
+    # JSONB columns need a NEW list assignment so SQLAlchemy notices the change.
+    exp.bills = existing + stored_new
+    db.commit()
+    db.refresh(exp)
+    return _to_out(exp)
+
+
+@router.delete("/{expense_id}/bill/{index}", response_model=ExpenseOut)
+def delete_bill(
+    expense_id: int,
+    index: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Remove one attached bill by its position in the expense's bills list."""
+    exp = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not exp:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+    _assert_can_edit_bills(exp, user)
+
+    bills = list(exp.bills or [])
+    if index < 0 or index >= len(bills):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"No bill at index {index}",
+        )
+    removed = bills.pop(index)
+    # Best-effort MinIO cleanup — the DB write is the source of truth.
+    key = removed.get("object_key") or ""
+    if key:
+        try:
+            storage.delete_object(key)
+        except Exception:
+            pass
+    exp.bills = bills
+    db.commit()
+    db.refresh(exp)
+    return _to_out(exp)
+
+
 # ============================================================
 # Monthly summary Excel export
 # ============================================================
