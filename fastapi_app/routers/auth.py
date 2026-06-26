@@ -7,7 +7,7 @@ from auth import (
     create_access_token, create_refresh_token, hash_password, verify_password,
 )
 from database import get_db
-from models import Department, User
+from models import Department, User 
 from schemas import LoginRequest, SignupRequest, TokenResponse, UserOut
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])

@@ -826,10 +826,15 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         n = f"{(e.first_name or '').strip()} {(e.last_name or '').strip()}".strip()
         return n or e.username or "—"
 
-    # Sort: department A→Z (empties last), then by full name.
+    # Sort: NON-MISSING employees first (department A→Z, name A→Z), then
+    # the missing/red rows in the same dept+name order at the BOTTOM.  HR
+    # asked for the red rows to be visually separated so the filing list
+    # stays on top and the laggards collect at the bottom.
     def sort_key(e):
         dn = _emp_dept_name(e)
+        is_missing = month_count_by_user.get(e.id, 0) == 0
         return (
+            1 if is_missing else 0,
             1 if not dn else 0,
             dn.lower(),
             _full_name(e).lower(),
@@ -881,6 +886,9 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
 
     row_idx = 5
     serial = 0
+    # Track (row_idx, (is_missing, dept_name)) for every rendered row so we
+    # can draw a thicker divider on the LAST row of each department group.
+    rendered_keys: list[tuple[int, tuple[bool, str]]] = []
     for emp in employees:
         # Skip non-reporting depts (R&D, Finance) — matches the on-screen
         # "Total Employees" headline card scope.
@@ -891,6 +899,7 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         mo = month_count_by_user.get(emp.id, 0)
         # "Not filing" = zero distinct days submitted this calendar month.
         is_missing = mo == 0
+        rendered_keys.append((row_idx, (is_missing, _emp_dept_name(emp))))
         row_fill = miss_fill if is_missing else _ROW_FILL
         body_f = miss_body_font if is_missing else _BODY_FONT
         name_f = miss_name_font if is_missing else name_font
@@ -925,6 +934,26 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     _apply_table_borders(
         ws, header_row=4, last_row=last_row, first_col=2, last_col=last_col,
     )
+
+    # Draw a thicker divider at the bottom of every department group (and
+    # also between the non-missing and missing sections, which falls out of
+    # the same key-change check).  Cells keep their existing thin sides; we
+    # only swap the bottom side for the thicker one.
+    divider_rows: set[int] = set()
+    for i in range(len(rendered_keys) - 1):
+        if rendered_keys[i][1] != rendered_keys[i + 1][1]:
+            divider_rows.add(rendered_keys[i][0])
+    divider_side = Side(style="medium", color="6B7280")  # zinc-500
+    for r in divider_rows:
+        for c in range(2, last_col + 1):
+            existing = ws.cell(row=r, column=c).border
+            ws.cell(row=r, column=c).border = Border(
+                left=existing.left,
+                right=existing.right,
+                top=existing.top,
+                bottom=divider_side,
+            )
+
     ws.freeze_panes = "B5"
     _set_print_landscape_fit(ws)
 
