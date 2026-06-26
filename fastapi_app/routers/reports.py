@@ -740,7 +740,10 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     derived from the reports filed across the current calendar week /
     month respectively — same logic as the on-screen badges.
     """
-    NON_REPORTING_DEPTS = {"rd", "finance"}
+    # Departments whose employees are skipped on the roster sheet.  Finance
+    # was previously excluded but HR now wants them counted alongside every
+    # other reporting team.  R&D stays excluded.
+    NON_REPORTING_DEPTS = {"rd"}
 
     employees = (
         db.query(User)
