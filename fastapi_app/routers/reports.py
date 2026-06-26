@@ -745,10 +745,12 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     # other reporting team.  R&D stays excluded.
     NON_REPORTING_DEPTS = {"rd"}
 
+    # Include HR users on the roster too — HR asked to see themselves in
+    # the summary alongside everyone else.  Their week/month columns will
+    # naturally show their own filing record.
     employees = (
         db.query(User)
         .filter(User.is_active.is_(True))
-        .filter(User.role != "hr")
         .all()
     )
 
