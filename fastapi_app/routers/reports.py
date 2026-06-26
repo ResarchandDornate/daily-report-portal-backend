@@ -446,6 +446,7 @@ def export_xlsx(
     inside_sales_group = None
     service_group = None
     project_group = None
+    project_coord_group = None    # Project Coordination
     marketing_group = None
     production_group = None
     logistics_group = None
@@ -517,6 +518,18 @@ def export_xlsx(
             or name_l in ("web dev", "web development", "webdev")
             or ("web" in name_l and "dev" in name_l)
         )
+        # Project Coordination — covers the renamed/extended project ops
+        # team.  Detection accepts every slug spelling HR is likely to use
+        # (camel / snake / kebab / spaced) plus a name-substring fallback.
+        is_project_coord = (
+            slug_l in (
+                "projectcoordination", "project_coordination",
+                "project-coordination", "projectcoord", "project_coord",
+                "project-coord", "projectco",
+            )
+            or "project coordination" in name_l
+            or ("project" in name_l and "coord" in name_l)
+        )
         if slug == "sales":
             sales_group = group
         elif is_sales_head:
@@ -527,6 +540,10 @@ def export_xlsx(
             inside_sales_group = group
         elif slug == "service":
             service_group = group
+        elif is_project_coord:
+            # Check Project Coordination BEFORE the generic "project" slug
+            # so a renamed/extended project dept routes to its own tab.
+            project_coord_group = group
         elif slug == "project":
             project_group = group
         elif slug == "marketing":
@@ -595,6 +612,19 @@ def export_xlsx(
     if project_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Project — Detail"))
         _build_project_detail_sheet(ws, project_group, range_label=range_label)
+
+    if project_coord_group:
+        # Tab title follows the department's actual DB name so HR can
+        # rename it without touching code.  Falls back to the canonical
+        # "Project Coordination" label.
+        pc_name = (
+            getattr(project_coord_group["dept"], "name", "")
+            if project_coord_group.get("dept") else ""
+        ) or "Project Coordination"
+        ws = wb.create_sheet(title=_unique_sheet_name(wb, f"{pc_name} — Detail"))
+        _build_dept_detail_sheet(
+            ws, project_coord_group, range_label=range_label,
+        )
 
     if marketing_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Marketing — Detail"))
@@ -1357,17 +1387,25 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                 if v and str(v).strip() and str(v).strip().lower() != "on leave"
             ]
             if not non_empty:
-                cells[key] = (_DASH, "muted")
+                cells[key] = (_DASH, "muted", 0)
                 continue
             # Decide numeric vs text by label hint OR strict parse.
             if _NUMERIC_LABEL_RE.search(label) or _MEETING_LABEL_RE.search(label) or _REVENUE_LABEL_RE.search(label):
                 total = sum(n for _, v in non_empty for n in _extract_numbers_text(v))
                 is_money = bool(_REVENUE_LABEL_RE.search(label))
                 if is_money:
-                    cells[key] = (_format_revenue(total) if total else "₹0", "money" if total else "muted")
+                    # Keep the raw rupee total alongside the formatted "₹X.XX L"
+                    # display so the column footer can sum it correctly.
+                    # Re-parsing the formatted string lost the lakh scale
+                    # ("₹1.36 L" was being read as 1.36, not 136000).
+                    cells[key] = (
+                        _format_revenue(total) if total else "₹0",
+                        "money" if total else "muted",
+                        float(total),
+                    )
                 else:
                     disp = int(total) if float(total).is_integer() else round(total, 2)
-                    cells[key] = (disp, "num")
+                    cells[key] = (disp, "num", float(total))
             else:
                 # Strict-parse check.
                 nums, all_num = [], True
@@ -1381,7 +1419,7 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                 if all_num and nums:
                     total = sum(nums)
                     disp = int(total) if float(total).is_integer() else round(total, 2)
-                    cells[key] = (disp, "num")
+                    cells[key] = (disp, "num", float(total))
                 else:
                     # Text — compact join: distinct values, headline-only,
                     # trimmed to fit ~120 chars total with a trailing "…"
@@ -1392,7 +1430,7 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                             continue
                         seen.add(v.lower())
                         distinct.append(v)
-                    cells[key] = (_compact_join(distinct, max_chars=120), "body")
+                    cells[key] = (_compact_join(distinct, max_chars=120), "body", 0)
         user_rows.append({"name": full_name, "cells": cells})
     user_rows.sort(key=lambda r: r["name"].lower())
 
@@ -1408,7 +1446,8 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
     for row in user_rows:
         _put(ws, row_idx, 2, row["name"], font=_NAME_FONT, fill=_ROW_FILL, align=body_left)
         for i, f in enumerate(fields):
-            v, kind = row["cells"].get(f.get("key", ""), (_DASH, "muted"))
+            entry = row["cells"].get(f.get("key", ""), (_DASH, "muted", 0))
+            v, kind = entry[0], entry[1]
             if kind == "money":
                 _put(ws, row_idx, 3 + i, v, font=money_data_font, fill=_ROW_FILL, align=num_align)
             elif kind == "num":
@@ -1419,28 +1458,29 @@ def _build_dept_detail_sheet(ws, group, *, range_label: str, exclude_keys=()):
                 _put(ws, row_idx, 3 + i, v, font=_MUTED_FONT, fill=_ROW_FILL, align=_CENTER)
         row_idx += 1
 
-    # Total row — navy bold text on light-blue fill for every cell.
+    # Total row — navy bold text on light-blue fill for every cell.  Money
+    # and numeric totals come from the raw value we stashed when building
+    # each row (NOT by re-parsing the formatted "₹X.XX L" display string,
+    # which silently lost the lakh scale and produced "₹0.00 L" totals).
     if user_rows:
         _put(ws, row_idx, 2, "Total",
              font=total_navy_font, fill=_TOTAL_FILL, align=body_left)
         for i, f in enumerate(fields):
-            cells = [r["cells"].get(f.get("key", ""), (_DASH, "muted")) for r in user_rows]
-            kinds = {k for _, k in cells}
+            cells = [r["cells"].get(f.get("key", ""), (_DASH, "muted", 0)) for r in user_rows]
+            kinds = {entry[1] for entry in cells}
             if "money" in kinds:
-                total = sum(
-                    n for v, k in cells if k == "money"
-                    for n in _extract_numbers_text(str(v).replace("₹", "").replace(",", ""))
-                )
+                total = sum(entry[2] for entry in cells if entry[1] == "money")
                 _put(ws, row_idx, 3 + i, _format_revenue(total) if total else "₹0",
                      font=total_navy_font, fill=_TOTAL_FILL, align=num_align)
             elif "num" in kinds and "body" not in kinds:
-                total = sum(v for v, k in cells if k == "num" and isinstance(v, (int, float)))
+                total = sum(entry[2] for entry in cells if entry[1] == "num")
                 disp = int(total) if float(total).is_integer() else round(total, 2)
                 _put(ws, row_idx, 3 + i, disp,
                      font=total_navy_font, fill=_TOTAL_FILL, align=num_align)
             elif "body" in kinds:
                 all_vals = set()
-                for v, k in cells:
+                for entry in cells:
+                    v, k = entry[0], entry[1]
                     if k == "body" and isinstance(v, str):
                         for piece in v.split(","):
                             p = piece.strip()
@@ -1500,7 +1540,7 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
         "Complaints (with sites)",
         "Kusum Docs Submitted (with project)",
         "Clients for Loan (with name)",
-        "Calls for Kusum Docs",
+        "Sales Calling Done",
         "Subtotal",
     ]
     for i, h in enumerate(headers, start=2):
@@ -1530,23 +1570,39 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
     complaint_keys: list[str] = []
     kusum_doc_keys: list[str] = []
     loan_keys: list[str] = []
-    kusum_call_keys: list[str] = []
+    call_keys: list[str] = []
+    # Order matters here: Loan must be checked BEFORE the generic
+    # "doc + submit" matcher, otherwise "Loan Docs Submitted" gets swallowed
+    # into kusum_doc_keys.  Calls is broadened to any field whose name
+    # mentions "call"/"calling" so "Sales Calling Done" lands in the calls
+    # column (was previously gated on `kusum` AND `call`).
     for f in dept_fields:
-        # Calls for Kusum Docs: requires BOTH 'kusum' and 'call' tokens.
-        if _match(f, r"kusum", r"call"):
-            kusum_call_keys.append(f["key"])
-            continue
-        # Kusum Docs Submitted: 'kusum' or 'doc submit' or 'document submit'.
+        # Loan / finance — check first because field names like
+        # "Loan Docs Submitted" would otherwise be misclassified as kusum
+        # docs by the doc/submit matcher below.
         if (
-            _match(f, r"kusum") and _match(f, r"doc|submit")
-            or _match(f, r"document", r"submit")
-            or _match(f, r"doc", r"submit")
+            _match(f, r"\bloan\b")
+            or _match(f, r"\bfinance\b")
+            or _match(f, r"\bemi\b")
+            or _match(f, r"\bfunding\b")
         ):
+            loan_keys.append(f["key"])
+            continue
+        # Any calling-activity field (Sales Calling Done, Calls for Kusum
+        # Docs, etc).  Excludes "callback" hits via a word-boundary check.
+        if _match(f, r"\b(?:call|calling|calls)\b"):
+            call_keys.append(f["key"])
+            continue
+        # Kusum Docs Submitted — restricted to fields explicitly mentioning
+        # `kusum` so the matcher doesn't sweep up unrelated doc fields.
+        if _match(f, r"kusum") and _match(f, r"doc|submit"):
             kusum_doc_keys.append(f["key"])
             continue
-        # Loan / finance.
-        if _match(f, r"\bloan\b") or _match(f, r"\bfinance\b") or _match(f, r"\bemi\b") or _match(f, r"\bfunding\b"):
-            loan_keys.append(f["key"])
+        # Generic Docs Submitted (only if no kusum/loan field already
+        # claimed this slot — i.e. when the dept has a single "X Docs
+        # Submitted" field that isn't loan-specific).
+        if _match(f, r"document", r"submit") or _match(f, r"\bdoc\b", r"submit"):
+            kusum_doc_keys.append(f["key"])
             continue
         # Complaints / issues / tickets.
         if _match(f, r"complain|complaint|issue|ticket"):
@@ -1680,7 +1736,7 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
         complaint_days = days_with(complaint_keys)
         kusum_days = days_with(kusum_doc_keys)
         loan_days = days_with(loan_keys)
-        kusum_call_days = days_with(kusum_call_keys)
+        call_days = days_with(call_keys)
 
         # Extract names ONLY from the relevant field's pooled text.
         complaint_sites = _scan_sites(pooled(complaint_keys))
@@ -1689,22 +1745,22 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
 
         # For the Calls column, prefer an explicit "Calls – N" phrase total
         # when one is present in that field; otherwise fall back to days.
-        kusum_call_phrase_total = _sum_phrase_counts(
-            pooled(kusum_call_keys),
+        call_phrase_total = _sum_phrase_counts(
+            pooled(call_keys),
             re.compile(r"\bcall", re.I),
         )
-        kusum_calls = max(kusum_call_phrase_total, kusum_call_days)
+        sales_calls = max(call_phrase_total, call_days)
 
         row_subtotal = (
-            complaint_days + kusum_days + loan_days + kusum_calls
+            complaint_days + kusum_days + loan_days + sales_calls
         )
 
         user_rows.append({
-            "name": full_name,
+            "name": full_name or "—",
             "complaints_text": _fmt_with_count(complaint_sites, complaint_days),
             "kusum_text": _fmt_with_count(kusum_projects, kusum_days),
             "loans_text": _fmt_with_count(loan_clients, loan_days),
-            "kusum_calls": kusum_calls,
+            "sales_calls": sales_calls,
             "subtotal": row_subtotal,
         })
     user_rows.sort(key=lambda r: r["name"].lower())
@@ -1720,7 +1776,7 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
                  font=_BODY_FONT if txt != _DASH else _MUTED_FONT,
                  fill=_ROW_FILL,
                  align=body_left if txt != _DASH else right_align)
-        _put(ws, row_idx, 6, row["kusum_calls"],
+        _put(ws, row_idx, 6, row["sales_calls"],
              font=num_font, fill=_ROW_FILL, align=right_align)
         _put(ws, row_idx, 7, row["subtotal"],
              font=Font(bold=True, size=10, color="1A1A1A"),
@@ -1732,7 +1788,7 @@ def _build_sales_service_detail_sheet(ws, group, *, range_label: str):
         _put(ws, row_idx, 3, "", fill=_TOTAL_FILL)
         _put(ws, row_idx, 4, "", fill=_TOTAL_FILL)
         _put(ws, row_idx, 5, "", fill=_TOTAL_FILL)
-        _put(ws, row_idx, 6, sum(r["kusum_calls"] for r in user_rows),
+        _put(ws, row_idx, 6, sum(r["sales_calls"] for r in user_rows),
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
         _put(ws, row_idx, 7, sum(r["subtotal"] for r in user_rows),
              font=_TOTAL_FONT, fill=_TOTAL_FILL, align=right_align)
