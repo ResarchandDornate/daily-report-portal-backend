@@ -1,5 +1,10 @@
 """Pydantic request/response shapes."""
-from datetime import date, datetime
+# Aliased to `date_type` because several models use `date` as a FIELD name
+# (e.g. ExpensePatchIn.date).  Without this alias, the field name shadows
+# the imported type when Pydantic v2 re-evaluates annotations via
+# `typing.get_type_hints()` — `Optional[date_type]` collapses to `Optional[None]`
+# and the field rejects every non-None value with "Input should be None".
+from datetime import date as date_type, datetime
 from typing import Optional
 
 from pydantic import BaseModel, EmailStr
@@ -55,9 +60,9 @@ class UserOut(BaseModel):
     # Roster fields
     organisation: str = ""
     reporting_manager: str = ""
-    date_of_joining: Optional[date] = None
+    date_of_joining: Optional[date_type] = None
     # Filled in when the user was deactivated (sent to "Employees Left").
-    date_of_leaving: Optional[date] = None
+    date_of_leaving: Optional[date_type] = None
 
     class Config:
         from_attributes = True
@@ -126,7 +131,7 @@ class EmployeeCreate(BaseModel):
     is_team_head: bool = False
     organisation: str = ""
     reporting_manager: str = ""
-    date_of_joining: Optional[date] = None
+    date_of_joining: Optional[date_type] = None
 
 
 class EmployeeUpdate(BaseModel):
@@ -139,8 +144,8 @@ class EmployeeUpdate(BaseModel):
     role: Optional[str] = None
     organisation: Optional[str] = None
     reporting_manager: Optional[str] = None
-    date_of_joining: Optional[date] = None
-    date_of_leaving: Optional[date] = None
+    date_of_joining: Optional[date_type] = None
+    date_of_leaving: Optional[date_type] = None
     is_active: Optional[bool] = None
     is_team_head: Optional[bool] = None
     # Slug of the department this team head manages (overrides their own dept).
@@ -152,7 +157,7 @@ class EmployeeUpdate(BaseModel):
 # ---------- Daily Report ----------
 
 class ReportIn(BaseModel):
-    date: date
+    date: date_type
     data: dict[str, str] = {}
     # Optional override — only HR users may set this to submit on behalf of
     # another employee.  Non-HR callers must leave it null (default).
@@ -160,7 +165,7 @@ class ReportIn(BaseModel):
 
 
 class LeaveIn(BaseModel):
-    start_date: date
+    start_date: date_type
     days: int = 1
     reason: str = ""
     user_id: int | None = None  # HR-only: apply leave on behalf of another
@@ -168,7 +173,7 @@ class LeaveIn(BaseModel):
 
 class ReportOut(BaseModel):
     id: int
-    date: date
+    date: date_type
     user_id: int
     data: dict[str, str] = {}
     submitted_at: datetime
@@ -191,8 +196,8 @@ class SalesUploadOut(BaseModel):
     user_id: int
     user_name: str = ""
     period_type: str
-    period_start: Optional[date] = None
-    period_end: Optional[date] = None
+    period_start: Optional[date_type] = None
+    period_end: Optional[date_type] = None
     note: str = ""
     original_filename: str
     file_size_bytes: int
@@ -221,7 +226,7 @@ class ExpenseOut(BaseModel):
     user_id: int
     user_name: str = ""
     user_department: str = ""
-    date: date
+    date: date_type
     mode: str = ""
     expense_type: str
     travel_type: str = ""
@@ -256,7 +261,7 @@ class ExpensePatchIn(BaseModel):
     that are non-None get applied.  Bills are managed via separate upload /
     delete endpoints (left untouched on edit).
     """
-    date: Optional[date] = None
+    date: Optional[date_type] = None
     mode: Optional[str] = None
     expense_type: Optional[str] = None
     travel_type: Optional[str] = None
