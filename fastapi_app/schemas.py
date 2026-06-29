@@ -243,6 +243,12 @@ class ExpenseOut(BaseModel):
     decided_by_name: str = ""
     decided_at: Optional[datetime] = None
     decision_note: str = ""
+    # Set once the finance approver (Shivangi) marks the row Paid.  Status
+    # transitions to "paid" at the same moment; these fields are the audit
+    # of who disbursed and when, kept separate from the decided_* set.
+    paid_by_id: Optional[int] = None
+    paid_by_name: str = ""
+    paid_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:
