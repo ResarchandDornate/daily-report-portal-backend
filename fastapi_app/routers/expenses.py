@@ -54,6 +54,13 @@ APPROVER_EMAILS = {
     "smita@ornatesolar.com",
 }
 
+# Finance-team disbursal — only Shivangi can mark an approved expense as
+# "paid".  Same email-based gate as the approver set so the role doesn't
+# need to be remodelled.  Add more entries if Finance brings in cover.
+FINANCE_APPROVER_EMAILS = {
+    "shivangi@ornatesolar.com",
+}
+
 # Allowed expense types — server-side enum so the frontend can't smuggle in
 # arbitrary values.  "travel" requires `travel_type` to also be one of the
 # travel sub-types below.
@@ -90,6 +97,14 @@ def _is_approver(user: User) -> bool:
         return True
     email = (user.email or "").strip().lower()
     return email in APPROVER_EMAILS
+
+
+def _is_finance_approver(user: User) -> bool:
+    """Shivangi — the only account allowed to mark an approved expense
+    as paid.  Kept separate from the approval gate; she does NOT get to
+    approve/reject, only to disburse."""
+    email = (user.email or "").strip().lower()
+    return email in FINANCE_APPROVER_EMAILS
 
 
 def _full_name(u: User | None) -> str:
@@ -131,6 +146,9 @@ def _to_out(exp: Expense) -> ExpenseOut:
         decided_by_name=_full_name(exp.decided_by),
         decided_at=exp.decided_at,
         decision_note=exp.decision_note or "",
+        paid_by_id=exp.paid_by_id,
+        paid_by_name=_full_name(exp.paid_by),
+        paid_at=exp.paid_at,
         created_at=exp.created_at,
     )
 
@@ -269,11 +287,18 @@ def list_expenses(
 ):
     """List expenses visible to the caller.
 
-    Employees see ONLY their own expenses.  HR + named approvers see ALL
-    expenses across the org (newest first).
+    - HR + named approvers (Tarini / Smita) see ALL expenses.
+    - Finance approvers (Shivangi) see ONLY `approved` + `paid` rows —
+      pending / onhold / rejected expenses are filtered out so her view
+      is just her disbursal queue + history.
+    - Regular employees see only their own expenses.
     """
     q = db.query(Expense).join(User, Expense.user_id == User.id)
-    if not _is_approver(user):
+    if _is_approver(user):
+        pass  # see everything
+    elif _is_finance_approver(user):
+        q = q.filter(Expense.status.in_(("approved", "paid")))
+    else:
         q = q.filter(Expense.user_id == user.id)
     rows = q.order_by(Expense.created_at.desc()).limit(2000).all()
     return [_to_out(r) for r in rows]
@@ -375,6 +400,40 @@ def decide_expense(
     exp.decided_by_id = user.id
     exp.decided_at = datetime.now(timezone.utc)
     exp.decision_note = (payload.note or "").strip()
+    db.commit()
+    db.refresh(exp)
+    return _to_out(exp)
+
+
+@router.post("/{expense_id}/mark-paid", response_model=ExpenseOut)
+def mark_paid(
+    expense_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Finance-approver-only: mark an approved expense as paid.
+
+    Terminal action — once marked paid, the row is locked (matches the
+    `Approved` / `Rejected` lock).  Only the finance approver (Shivangi)
+    can call this; HR / Tarini / Smita are NOT allowed because the audit
+    trail wants the disbursal step distinct from the approval decision.
+    """
+    if not _is_finance_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the finance approver can mark expenses as paid.",
+        )
+    exp = db.query(Expense).filter(Expense.id == expense_id).first()
+    if not exp:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+    if exp.status != "approved":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Only approved expenses can be marked paid (this is {exp.status!r}).",
+        )
+    exp.status = "paid"
+    exp.paid_by_id = user.id
+    exp.paid_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(exp)
     return _to_out(exp)

@@ -273,7 +273,10 @@ class Expense(Base):
     bills = Column(
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )
-    # Approval lifecycle: pending → approved | rejected.
+    # Approval lifecycle: pending → onhold → approved | rejected → paid.
+    # "paid" is the terminal status set by the finance approver (Shivangi)
+    # after the expense has been approved — represents that the money has
+    # actually been disbursed to the employee.
     status = Column(
         String(16), nullable=False, default="pending", server_default="pending"
     )
@@ -286,12 +289,21 @@ class Expense(Base):
     decision_note = Column(
         String(512), nullable=False, default="", server_default=""
     )
+    # Set when the finance approver marks the row Paid — separate from
+    # decided_*  so we keep both the approval and disbursal audit trail.
+    paid_by_id = Column(
+        BigInteger,
+        ForeignKey("users_user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    paid_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     user = relationship("User", foreign_keys=[user_id])
     decided_by = relationship("User", foreign_keys=[decided_by_id])
+    paid_by = relationship("User", foreign_keys=[paid_by_id])
 
     __table_args__ = (
         Index("ix_expenses_user_date", "user_id", "date"),
