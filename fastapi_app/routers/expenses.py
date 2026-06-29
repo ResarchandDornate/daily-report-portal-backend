@@ -1174,36 +1174,73 @@ def list_advances(
 ):
     """Approver-only: every advance ever recorded, newest first.
 
-    Returns a flat list of `{ user_id, user_name, department, year, month,
-    advance, updated_at }` — only rows where advance > 0.  Used by the
-    Expense page's "Advances" panel.
+    Combines two sources so HR sees the full picture:
+      - `monthly_note` — HR's per-employee per-month advance entered via
+        the Monthly Summary modal.
+      - `expense` — the `advance` field on an individual expense row
+        (the employee reports they already received money against that
+        specific claim).  Previously these were invisible on the Advances
+        panel, which made employees like Rahul Sharma — who declared a
+        ₹21k advance across his 21 expenses — appear with zero advance.
+
+    Returned items share a common shape; `source` tells the frontend
+    where the row came from so it can label the period column accordingly.
     """
     if not _is_approver(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only HR / approvers can view the advances list.",
         )
-    rows = (
+
+    note_rows = (
         db.query(MonthlyExpenseNote)
         .join(User, MonthlyExpenseNote.user_id == User.id)
         .filter(MonthlyExpenseNote.advance > 0)
-        .order_by(MonthlyExpenseNote.updated_at.desc())
         .all()
     )
-    return {
-        "items": [
-            {
-                "user_id": n.user_id,
-                "user_name": _full_name(n.user) or "—",
-                "department": _dept_name(n.user) or "",
-                "year": n.year,
-                "month": n.month,
-                "advance": n.advance or 0,
-                "updated_at": n.updated_at.isoformat() if n.updated_at else None,
-            }
-            for n in rows
-        ]
-    }
+    expense_rows = (
+        db.query(Expense)
+        .join(User, Expense.user_id == User.id)
+        .filter(Expense.advance > 0)
+        .all()
+    )
+
+    items: list[dict] = []
+    for n in note_rows:
+        items.append({
+            "source": "monthly_note",
+            "user_id": n.user_id,
+            "user_name": _full_name(n.user) or "—",
+            "department": _dept_name(n.user) or "",
+            "year": n.year,
+            "month": n.month,
+            "advance": n.advance or 0,
+            "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+        })
+    for e in expense_rows:
+        items.append({
+            "source": "expense",
+            "expense_id": e.id,
+            "user_id": e.user_id,
+            "user_name": _full_name(e.user) or "—",
+            "department": _dept_name(e.user) or "",
+            "year": e.date.year if e.date else None,
+            "month": e.date.month if e.date else None,
+            "advance": e.advance or 0,
+            # Use the expense's own date as the "Date of Given" — that's
+            # the day the advance was tied to.  Falls back to created_at
+            # so the row still sorts correctly when date is missing.
+            "updated_at": (
+                e.date.isoformat() if e.date
+                else (e.created_at.isoformat() if e.created_at else None)
+            ),
+            "expense_status": e.status,
+            "expense_type": e.expense_type or "",
+        })
+
+    # Newest first.  Missing timestamps go to the bottom.
+    items.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
+    return {"items": items}
 
 
 @router.put("/monthly-notes")
