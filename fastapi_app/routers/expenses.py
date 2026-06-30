@@ -936,6 +936,7 @@ def department_summary_xlsx(
 
     UNASSIGNED = "Unassigned"
     by_dept: dict[str, list[Expense]] = {}
+    by_user: dict[int, list[Expense]] = {}
     employees_per_dept: dict[str, set[int]] = {}
     employee_totals: dict[int, dict] = {}
     grand_total = 0
@@ -943,6 +944,7 @@ def department_summary_xlsx(
     for r in rows:
         dept = _dept_name(r.user) or UNASSIGNED
         by_dept.setdefault(dept, []).append(r)
+        by_user.setdefault(r.user_id, []).append(r)
         employees_per_dept.setdefault(dept, set()).add(r.user_id)
         grand_total += (r.amount or 0)
 
@@ -1047,8 +1049,8 @@ def department_summary_xlsx(
     overview.cell(row=row_idx, column=2, value="By Employee").font = section_font
     row_idx += 1
 
-    emp_headers = ["Employee", "Department", "Total Amount", "Status", "Last Submit"]
-    emp_widths = [24, 22, 16, 26, 18]
+    emp_headers = ["Employee", "Department", "Total Amount", "Last Submit"]
+    emp_widths = [24, 22, 16, 18]
     for i, (h, w) in enumerate(zip(emp_headers, emp_widths), start=2):
         c = overview.cell(row=row_idx, column=i, value=h)
         c.font = header_font
@@ -1067,16 +1069,10 @@ def department_summary_xlsx(
         key=lambda kv: (kv[1]["dept"].lower(), kv[1]["name"].lower()),
     )
     for _uid, g in emp_sorted:
-        status_bits = []
-        if g["pending"]:  status_bits.append(f"P: {g['pending']}")
-        if g["onhold"]:   status_bits.append(f"H: {g['onhold']}")
-        if g["approved"]: status_bits.append(f"A: {g['approved']}")
-        if g["rejected"]: status_bits.append(f"R: {g['rejected']}")
         cells = [
             (g["name"], left),
             (g["dept"], left),
             (f"₹{g['total']:,.0f}", right),
-            (", ".join(status_bits) or "—", left),
             (g["latest_submit"].strftime("%d %b %Y") if g["latest_submit"] else "—", center),
         ]
         for col_offset, (val, align) in enumerate(cells):
@@ -1086,12 +1082,25 @@ def department_summary_xlsx(
             c.border = border
         row_idx += 1
 
-    # ---- Per-department sheets (only depts with expenses). ----
+    # ---- Per-employee sheets (one tab per employee with expenses). ----
+    # Sort by (department, name) so the tab order mirrors the Overview
+    # By-Employee table — easier to navigate when there are many tabs.
+    user_sorted = sorted(
+        by_user.keys(),
+        key=lambda uid: (
+            (employee_totals.get(uid, {}).get("dept") or "").lower(),
+            (employee_totals.get(uid, {}).get("name") or "").lower(),
+        ),
+    )
     used_titles: set[str] = {"Overview"}
-    for dept in dept_sorted:
+    for uid in user_sorted:
+        info = employee_totals.get(uid, {})
+        emp_name = info.get("name") or "—"
+        emp_dept = info.get("dept") or ""
+
         # Sheet titles capped at 31 chars by Excel; sanitize illegal chars.
-        clean = "".join(ch for ch in dept if ch not in r":\/?*[]") or "Dept"
-        title = clean[:31] or "Dept"
+        clean = "".join(ch for ch in emp_name if ch not in r":\/?*[]") or "Employee"
+        title = clean[:31] or "Employee"
         base = title
         suffix = 2
         while title in used_titles:
@@ -1101,24 +1110,26 @@ def department_summary_xlsx(
         used_titles.add(title)
 
         ws = wb.create_sheet(title=title)
-        dept_total = sum((e.amount or 0) for e in by_dept[dept])
-        ws["B1"] = f"{dept} — {month_label}"
+        emp_total = sum((e.amount or 0) for e in by_user[uid])
+        ws["B1"] = f"{emp_name} — {month_label}"
         ws["B1"].font = title_font
-        ws.merge_cells("B1:J1")
+        ws.merge_cells("B1:I1")
         ws["B2"] = (
-            f"Total: ₹{dept_total:,.0f}"
-            f"  ·  {len(employees_per_dept[dept])} employee{'s' if len(employees_per_dept[dept]) != 1 else ''}"
-            f"  ·  {len(by_dept[dept])} expense{'s' if len(by_dept[dept]) != 1 else ''}"
+            f"Total: ₹{emp_total:,.0f}"
+            f"  ·  {emp_dept or 'Unassigned'}"
+            f"  ·  {len(by_user[uid])} expense{'s' if len(by_user[uid]) != 1 else ''}"
         )
         ws["B2"].font = subtitle_font
-        ws.merge_cells("B2:J2")
+        ws.merge_cells("B2:I2")
         ws.column_dimensions["A"].width = 3
 
+        # Employee column is dropped — the whole tab is one employee, so
+        # repeating the name on every row was redundant.
         headers = [
-            "Date", "Employee", "Site", "Type", "Mode",
+            "Date", "Site", "Type", "Mode",
             "Amount", "Status", "Submit Date", "Remarks",
         ]
-        widths = [12, 22, 22, 16, 10, 14, 12, 14, 40]
+        widths = [12, 22, 16, 10, 14, 12, 14, 40]
         for i, (h, w) in enumerate(zip(headers, widths), start=2):
             c = ws.cell(row=4, column=i, value=h)
             c.font = header_font
@@ -1129,8 +1140,8 @@ def department_summary_xlsx(
         ws.row_dimensions[4].height = 24
 
         sorted_exps = sorted(
-            by_dept[dept],
-            key=lambda e: (_full_name(e.user).lower(), e.date or date_type.min),
+            by_user[uid],
+            key=lambda e: (e.date or date_type.min),
         )
         r_idx = 5
         for e in sorted_exps:
@@ -1139,7 +1150,6 @@ def department_summary_xlsx(
                 etype = f"{etype} ({e.travel_type})" if etype else e.travel_type
             cells = [
                 (e.date.strftime("%d %b %Y") if e.date else "—", center),
-                (_full_name(e.user) or "—", left),
                 (e.site_name or "—", left),
                 (etype or "—", left),
                 ((e.mode or "—"), left),
@@ -1155,17 +1165,17 @@ def department_summary_xlsx(
                 c.border = border
             r_idx += 1
 
-        # Footer total row for the department.  Amount column shifted to
-        # col 7 after inserting Site between Employee and Type.
+        # Footer total row for the employee.  Amount column sits at col 6
+        # after dropping the Employee column.
         if sorted_exps:
             ws.cell(row=r_idx, column=2, value="Total")
-            ws.cell(row=r_idx, column=7, value=f"₹{dept_total:,.0f}")
-            for col in range(2, 11):
+            ws.cell(row=r_idx, column=6, value=f"₹{emp_total:,.0f}")
+            for col in range(2, 10):
                 c = ws.cell(row=r_idx, column=col)
                 c.font = total_font
                 c.fill = total_fill
                 c.border = border
-                c.alignment = right if col == 7 else left
+                c.alignment = right if col == 6 else left
 
     buf = io.BytesIO()
     wb.save(buf)
