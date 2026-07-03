@@ -572,9 +572,15 @@ def export_xlsx(
             other_groups.append(group)
 
     # All Employees roster — first tab so HR sees the headcount snapshot
-    # before any per-department breakdown.
+    # before any per-department breakdown.  Filing counters are scoped to
+    # the selected `start`/`end` range so the roster reflects that window,
+    # not the current calendar week/month.
     ws = wb.create_sheet(title=_unique_sheet_name(wb, "All Employees"))
-    _build_all_employees_sheet(ws, db, range_label=range_label, today_label=today_label)
+    _build_all_employees_sheet(
+        ws, db,
+        range_label=range_label, today_label=today_label,
+        start=start, end=end,
+    )
 
     if sales_group:
         ws = wb.create_sheet(title=_unique_sheet_name(wb, "Sales — Detail"))
@@ -761,14 +767,18 @@ def _apply_table_borders(ws, *, header_row: int, last_row: int, first_col: int, 
             ws.cell(row=r, column=c).border = _CELL_BORDER
 
 
-def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
+def _build_all_employees_sheet(
+    ws, db, *,
+    range_label: str, today_label: str,
+    start: date_type | None = None, end: date_type | None = None,
+):
     """Roster snapshot of every active employee — matches the on-screen
     All Employees page (sorted by department, then name).  Columns:
       Organisation | S. No. | Name | Department | Reporting Manager |
-      Date of Joining | This Week | This Month
-    The This Week / This Month cells show "<filled> / <total>" workdays
-    derived from the reports filed across the current calendar week /
-    month respectively — same logic as the on-screen badges.
+      Date of Joining | Reports Filed (<range>) | Leaves (<range>)
+    The Reports Filed cell shows "<filled> / <total>" where the totals are
+    the Mon-Fri workdays within the SELECTED date range (falls back to the
+    current calendar month if the caller didn't pass a range).
     """
     # Departments whose employees are skipped on the roster sheet.  Finance
     # was previously excluded but HR now wants them counted alongside every
@@ -784,61 +794,60 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         .all()
     )
 
-    # Date windows for the week / month counters.
+    # Effective date range for the filing counters.  If the caller passed
+    # start/end, use those verbatim; otherwise fall back to the current
+    # calendar month capped at today (matches the old behaviour).
     today = date_type.today()
-    # Current calendar week (Mon → Fri).
-    monday = today - timedelta(days=today.weekday())
-    friday = monday + timedelta(days=4)
-    # Current calendar month.
-    month_first = today.replace(day=1)
-    if today.month == 12:
-        next_first = date_type(today.year + 1, 1, 1)
+    if start is not None and end is not None:
+        range_start = start
+        range_end = end
+    elif start is not None:
+        range_start = start
+        range_end = today
+    elif end is not None:
+        range_start = end.replace(day=1)
+        range_end = end
     else:
-        next_first = date_type(today.year, today.month + 1, 1)
-    month_last = next_first - timedelta(days=1)
-    # Mon-Fri workdays from start-of-month through TODAY — this is the
-    # denominator HR wants on the "This Month" cell ("days they SHOULD have
-    # filed so far this month").  Full-month workday count is no longer
-    # used; the elapsed-so-far figure makes the ratio meaningful before
-    # month-end (e.g. "0 / 16" on 22 Jun instead of "0 / 22").
-    month_workdays_elapsed = 0
-    d = month_first
-    while d <= today:
+        range_start = today.replace(day=1)
+        range_end = today
+
+    # Denominator = Mon-Fri workdays inside the range.  Anchoring on the
+    # range (not "today") is what the user asked for — a report generated
+    # for June should measure against June's workdays, not July's.
+    range_workdays = 0
+    d = range_start
+    while d <= range_end:
         if d.weekday() < 5:
-            month_workdays_elapsed += 1
+            range_workdays += 1
         d += timedelta(days=1)
-    month_label = month_first.strftime("%b").upper()
 
-    # Pull every report in the week + month windows in one go.  Include
-    # `data` for the month query so we can detect leave rows (`__leave__=1`).
-    week_reports = (
-        db.query(DailyReport.user_id, DailyReport.date)
-        .filter(DailyReport.date >= monday, DailyReport.date <= friday)
-        .all()
-    )
-    month_reports = (
+    # Column header suffix — if the range sits inside one calendar month,
+    # use the month name; otherwise use the DD Mmm range.
+    if (
+        range_start.year == range_end.year
+        and range_start.month == range_end.month
+        and range_start.day == 1
+    ):
+        range_col_label = range_start.strftime("%b %Y")
+    else:
+        range_col_label = (
+            f"{range_start.strftime('%d %b')}–{range_end.strftime('%d %b')}"
+        )
+
+    # Pull every report inside the effective range in one go.  Include the
+    # `data` column so we can detect leave rows (`__leave__ == "1"`).
+    range_reports = (
         db.query(DailyReport.user_id, DailyReport.date, DailyReport.data)
-        .filter(DailyReport.date >= month_first, DailyReport.date <= month_last)
+        .filter(DailyReport.date >= range_start, DailyReport.date <= range_end)
         .all()
     )
 
-    # week_submitted_by_user[uid] = highest weekday index reached (Mon=1..Fri=5).
-    # Leave rows count as "submitted" for the week badge (the employee did
-    # account for the day, even if it was a leave entry).
-    week_submitted_by_user: dict[int, int] = {}
-    for uid, dt in week_reports:
-        if dt.weekday() >= 5:
-            continue
-        idx = dt.weekday() + 1  # Mon=0→1 ... Fri=4→5
-        if idx > week_submitted_by_user.get(uid, 0):
-            week_submitted_by_user[uid] = idx
-
-    # month_submitted_by_user[uid] = distinct weekdays filed in the month.
-    # leave_count_by_user[uid]     = distinct DAYS the employee was on leave
-    # (any day, including weekends — leaves are entered per real calendar day).
-    month_dates_by_user: dict[int, set] = {}
+    # range_dates_by_user[uid] = distinct weekdays filed inside the range.
+    # leave_dates_by_user[uid] = distinct DAYS the employee was on leave
+    # (any day, including weekends — leaves are entered per calendar day).
+    range_dates_by_user: dict[int, set] = {}
     leave_dates_by_user: dict[int, set] = {}
-    for uid, dt, data in month_reports:
+    for uid, dt, data in range_reports:
         is_leave = bool(data) and str(data.get("__leave__", "")) == "1"
         if is_leave:
             leave_dates_by_user.setdefault(uid, set()).add(dt)
@@ -846,13 +855,16 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
             # employee isn't double-penalised on the missing list.
         if dt.weekday() >= 5:
             continue
-        month_dates_by_user.setdefault(uid, set()).add(dt)
-    month_count_by_user = {
-        uid: len(dates) for uid, dates in month_dates_by_user.items()
+        range_dates_by_user.setdefault(uid, set()).add(dt)
+    range_count_by_user = {
+        uid: len(dates) for uid, dates in range_dates_by_user.items()
     }
     leave_count_by_user = {
         uid: len(dates) for uid, dates in leave_dates_by_user.items()
     }
+    # Alias kept for the existing sort_key which reads month_count_by_user
+    # to decide the "missing" red-row treatment.
+    month_count_by_user = range_count_by_user
 
     def _emp_dept_name(e):
         return (e.department.name if e.department else "") or ""
@@ -877,8 +889,8 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     employees.sort(key=sort_key)
 
     # Columns: B Organisation, C S.No, D Name, E Department, F Reporting Manager,
-    # G Date of Joining, H This Week, I This Month, J Leaves  → last_col = 10
-    last_col = 10
+    # G Date of Joining, H Reports Filed (range), I Leaves (range) → last_col = 9
+    last_col = 9
 
     ws.column_dimensions["A"].width = 3
     ws.column_dimensions["B"].width = 14   # Organisation
@@ -887,9 +899,8 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     ws.column_dimensions["E"].width = 20   # Department
     ws.column_dimensions["F"].width = 22   # Reporting Manager
     ws.column_dimensions["G"].width = 18   # Date of Joining
-    ws.column_dimensions["H"].width = 14   # This Week
-    ws.column_dimensions["I"].width = 14   # This Month
-    ws.column_dimensions["J"].width = 12   # Leaves
+    ws.column_dimensions["H"].width = 18   # Reports Filed (range)
+    ws.column_dimensions["I"].width = 14   # Leaves (range)
 
     _merge_title(ws, 1, last_col, "All Employees — Roster", _TITLE_FONT)
     ws.row_dimensions[1].height = 28
@@ -902,8 +913,8 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
     headers = [
         "Organisation", "S. No.", "Name", "Department",
         "Reporting Manager", "Date of Joining",
-        "This Week", f"This Month ({month_label})",
-        f"Leaves ({month_label})",
+        f"Reports Filed ({range_col_label})",
+        f"Leaves ({range_col_label})",
     ]
     for i, h in enumerate(headers, start=2):
         _put(ws, 4, i, h, font=_HEADER_FONT, fill=_HEADER_FILL, align=_CENTER)
@@ -930,10 +941,11 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         if emp.department and emp.department.slug in NON_REPORTING_DEPTS:
             continue
         serial += 1
-        wk = week_submitted_by_user.get(emp.id, 0)
-        mo = month_count_by_user.get(emp.id, 0)
-        # "Not filing" = zero distinct days submitted this calendar month.
-        is_missing = mo == 0
+        filed = range_count_by_user.get(emp.id, 0)
+        # "Not filing" = zero distinct workdays submitted inside the
+        # selected range — same red-row treatment as before, just scoped
+        # to the range instead of the current calendar month.
+        is_missing = filed == 0
         rendered_keys.append((row_idx, (is_missing, _emp_dept_name(emp))))
         row_fill = miss_fill if is_missing else _ROW_FILL
         body_f = miss_body_font if is_missing else _BODY_FONT
@@ -952,16 +964,15 @@ def _build_all_employees_sheet(ws, db, *, range_label: str, today_label: str):
         _put(ws, row_idx, 7,
              emp.date_of_joining.strftime("%a, %d %b %Y") if emp.date_of_joining else "—",
              font=body_f, fill=row_fill, align=center_align)
-        _put(ws, row_idx, 8, f"{wk} / 5",
+        # Reports Filed — X / Y where Y is Mon-Fri workdays inside the
+        # selected range.  This is what HR asked for: a June report should
+        # measure against June's workdays, not July's.
+        _put(ws, row_idx, 8, f"{filed} / {range_workdays}",
              font=body_f, fill=row_fill, align=center_align)
-        # "This Month" denominator = workdays elapsed from 1st through today
-        # (HR's ask) — so a non-filer reads "0 / 16" on 22 Jun, not "0 / 22".
-        _put(ws, row_idx, 9, f"{mo} / {month_workdays_elapsed}",
-             font=body_f, fill=row_fill, align=center_align)
-        # Leaves (current calendar month) — count of distinct days the
-        # employee filed a leave entry (`__leave__=1`).
+        # Leaves inside the range — distinct calendar days the employee
+        # filed a leave entry (`__leave__=1`).
         lv = leave_count_by_user.get(emp.id, 0)
-        _put(ws, row_idx, 10, lv,
+        _put(ws, row_idx, 9, lv,
              font=body_f, fill=row_fill, align=center_align)
         row_idx += 1
 
