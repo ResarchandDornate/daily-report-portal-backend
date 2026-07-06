@@ -71,7 +71,7 @@ ALLOWED_EXPENSE_TYPES = {
     "officereimburse", "sitematerial", "officematerial",
 }
 ALLOWED_TRAVEL_TYPES = {
-    "bus", "cab", "bike", "rapido", "car", "auto", "metro", "other",
+    "bus", "cab", "bike", "rapido", "car", "auto", "metro", "rickshaw", "other",
 }
 ALLOWED_MODES = {"cash", "upi", "card", "bank", "other", ""}
 
@@ -331,6 +331,294 @@ def _serve_bill(exp: Expense, bill: dict) -> Response:
         ),
     }
     return Response(content=data, media_type=mime, headers=headers)
+
+
+
+# ============================================================
+# Monthly-summary notes (advance + remark per user × month)
+# ============================================================
+
+def _note_to_dict(n: MonthlyExpenseNote) -> dict:
+    return {
+        "user_id": n.user_id,
+        "year": n.year,
+        "month": n.month,
+        "advance": n.advance or 0,
+        "remark": n.remark or "",
+        "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+    }
+
+
+@router.get("/monthly-notes")
+def list_monthly_notes(
+    year: int = Query(...),
+    month: int = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """List monthly notes for a (year, month).
+
+    Approvers (HR / Tarini / Smita) see EVERY employee's notes for the
+    period.  Regular employees see only their own row — so they can read
+    the HR remark for the current month on their own expense view.
+    """
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid year/month: {year}/{month}",
+        )
+    q = db.query(MonthlyExpenseNote).filter(
+        MonthlyExpenseNote.year == year,
+        MonthlyExpenseNote.month == month,
+    )
+    if not _is_approver(user):
+        q = q.filter(MonthlyExpenseNote.user_id == user.id)
+    rows = q.all()
+    return {"items": [_note_to_dict(r) for r in rows]}
+
+
+@router.get("/advances")
+def list_advances(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Approver-only: every advance ever recorded, newest first.
+
+    Combines two sources so HR sees the full picture:
+      - `monthly_note` — HR's per-employee per-month advance entered via
+        the Monthly Summary modal.
+      - `expense` — the `advance` field on an individual expense row
+        (the employee reports they already received money against that
+        specific claim).  Previously these were invisible on the Advances
+        panel, which made employees like Rahul Sharma — who declared a
+        ₹21k advance across his 21 expenses — appear with zero advance.
+
+    Returned items share a common shape; `source` tells the frontend
+    where the row came from so it can label the period column accordingly.
+    """
+    if not _is_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only HR / approvers can view the advances list.",
+        )
+
+    note_rows = (
+        db.query(MonthlyExpenseNote)
+        .join(User, MonthlyExpenseNote.user_id == User.id)
+        .filter(MonthlyExpenseNote.advance > 0)
+        .all()
+    )
+    expense_rows = (
+        db.query(Expense)
+        .join(User, Expense.user_id == User.id)
+        .filter(Expense.advance > 0)
+        .all()
+    )
+
+    items: list[dict] = []
+    for n in note_rows:
+        items.append({
+            "source": "monthly_note",
+            "user_id": n.user_id,
+            "user_name": _full_name(n.user) or "—",
+            "department": _dept_name(n.user) or "",
+            "year": n.year,
+            "month": n.month,
+            "advance": n.advance or 0,
+            "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+        })
+    for e in expense_rows:
+        items.append({
+            "source": "expense",
+            "expense_id": e.id,
+            "user_id": e.user_id,
+            "user_name": _full_name(e.user) or "—",
+            "department": _dept_name(e.user) or "",
+            "year": e.date.year if e.date else None,
+            "month": e.date.month if e.date else None,
+            "advance": e.advance or 0,
+            # Use the expense's own date as the "Date of Given" — that's
+            # the day the advance was tied to.  Falls back to created_at
+            # so the row still sorts correctly when date is missing.
+            "updated_at": (
+                e.date.isoformat() if e.date
+                else (e.created_at.isoformat() if e.created_at else None)
+            ),
+            "expense_status": e.status,
+            "expense_type": e.expense_type or "",
+        })
+
+    # Newest first.  Missing timestamps go to the bottom.
+    items.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
+    return {"items": items}
+
+
+@router.put("/monthly-notes")
+def upsert_monthly_note(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """HR-only: create or update a (user, year, month) note.
+
+    Body shape:
+        { "user_id": 17, "year": 2026, "month": 6,
+          "advance": 500, "remark": "On hold — awaiting director approval" }
+
+    Either `advance` or `remark` is optional but at least one should be
+    sent (sending both is fine).  Missing means "leave that field as-is".
+    """
+    if not _is_approver(user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only HR / approvers can edit monthly notes.",
+        )
+    try:
+        target_user_id = int(payload.get("user_id"))
+        year = int(payload.get("year"))
+        month = int(payload.get("month"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "user_id, year, and month are required integers.",
+        )
+    if month < 1 or month > 12 or year < 2000 or year > 2100:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid year/month: {year}/{month}",
+        )
+
+    # Find or create the note row.
+    note = (
+        db.query(MonthlyExpenseNote)
+        .filter(
+            MonthlyExpenseNote.user_id == target_user_id,
+            MonthlyExpenseNote.year == year,
+            MonthlyExpenseNote.month == month,
+        )
+        .first()
+    )
+    if note is None:
+        note = MonthlyExpenseNote(
+            user_id=target_user_id,
+            year=year,
+            month=month,
+            advance=0,
+            remark="",
+        )
+        db.add(note)
+
+    if "advance" in payload and payload["advance"] is not None:
+        try:
+            adv = max(0, int(float(payload["advance"])))
+        except (TypeError, ValueError):
+            adv = 0
+        note.advance = adv
+    if "remark" in payload and payload["remark"] is not None:
+        note.remark = str(payload["remark"])[:2048]
+    note.updated_by_id = user.id
+
+    db.commit()
+    db.refresh(note)
+    return _note_to_dict(note)
+
+
+# ── Employee self-records an advance received ────────────────────────────────
+
+@router.post("/record-advance", response_model=ExpenseOut, status_code=status.HTTP_201_CREATED)
+def record_advance(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Employee records an advance they received from HR.
+
+    Creates a synthetic expense row with amount=0 and advance=<value>
+    so it appears in the advance column of the expense table.
+    Body: { "amount": int, "date": "YYYY-MM-DD" | null, "note": str | null }
+    """
+    try:
+        amount = max(1, int(float(payload.get("amount") or 0)))
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "amount must be a positive integer")
+    raw_date = payload.get("date") or None
+    note = str(payload.get("note") or "")[:500]
+    if raw_date:
+        try:
+            from datetime import date as _date
+            exp_date = _date.fromisoformat(raw_date)
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "date must be YYYY-MM-DD")
+    else:
+        from datetime import date as _date
+        exp_date = _date.today()
+    exp = Expense(
+        user_id=user.id,
+        expense_type="others",
+        travel_type="",
+        mode="",
+        amount=0,
+        advance=amount,
+        site_name="Advance received",
+        remarks=note,
+        date=exp_date,
+        status="pending",
+    )
+    db.add(exp)
+    db.commit()
+    db.refresh(exp)
+    return _to_out(exp)
+
+
+# ── HR / approver issues an advance to a specific employee ───────────────────
+
+@router.post("/advance-issue", response_model=ExpenseOut, status_code=status.HTTP_201_CREATED)
+def advance_issue(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """HR issues an advance to a specific employee.
+
+    Body: { "employee_id": int, "amount": int, "date": "YYYY-MM-DD" | null, "note": str | null }
+    """
+    if not _is_approver(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR / approvers can issue advances.")
+    try:
+        employee_id = int(payload.get("employee_id") or 0)
+        amount = max(1, int(float(payload.get("amount") or 0)))
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "employee_id and amount are required integers")
+    target = db.get(User, employee_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee not found")
+    raw_date = payload.get("date") or None
+    note = str(payload.get("note") or "")[:500]
+    if raw_date:
+        try:
+            from datetime import date as _date
+            exp_date = _date.fromisoformat(raw_date)
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "date must be YYYY-MM-DD")
+    else:
+        from datetime import date as _date
+        exp_date = _date.today()
+    exp = Expense(
+        user_id=employee_id,
+        expense_type="others",
+        travel_type="",
+        mode="",
+        amount=0,
+        advance=amount,
+        site_name="Advance issued",
+        remarks=note,
+        date=exp_date,
+        status="pending",
+    )
+    db.add(exp)
+    db.commit()
+    db.refresh(exp)
+    return _to_out(exp)
 
 
 @router.get("/{expense_id}/bill/{index}")
@@ -1192,192 +1480,4 @@ def department_summary_xlsx(
         },
     )
 
-
-# ============================================================
-# Monthly-summary notes (advance + remark per user × month)
-# ============================================================
-
-def _note_to_dict(n: MonthlyExpenseNote) -> dict:
-    return {
-        "user_id": n.user_id,
-        "year": n.year,
-        "month": n.month,
-        "advance": n.advance or 0,
-        "remark": n.remark or "",
-        "updated_at": n.updated_at.isoformat() if n.updated_at else None,
-    }
-
-
-@router.get("/monthly-notes")
-def list_monthly_notes(
-    year: int = Query(...),
-    month: int = Query(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """List monthly notes for a (year, month).
-
-    Approvers (HR / Tarini / Smita) see EVERY employee's notes for the
-    period.  Regular employees see only their own row — so they can read
-    the HR remark for the current month on their own expense view.
-    """
-    if month < 1 or month > 12 or year < 2000 or year > 2100:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Invalid year/month: {year}/{month}",
-        )
-    q = db.query(MonthlyExpenseNote).filter(
-        MonthlyExpenseNote.year == year,
-        MonthlyExpenseNote.month == month,
-    )
-    if not _is_approver(user):
-        q = q.filter(MonthlyExpenseNote.user_id == user.id)
-    rows = q.all()
-    return {"items": [_note_to_dict(r) for r in rows]}
-
-
-@router.get("/advances")
-def list_advances(
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Approver-only: every advance ever recorded, newest first.
-
-    Combines two sources so HR sees the full picture:
-      - `monthly_note` — HR's per-employee per-month advance entered via
-        the Monthly Summary modal.
-      - `expense` — the `advance` field on an individual expense row
-        (the employee reports they already received money against that
-        specific claim).  Previously these were invisible on the Advances
-        panel, which made employees like Rahul Sharma — who declared a
-        ₹21k advance across his 21 expenses — appear with zero advance.
-
-    Returned items share a common shape; `source` tells the frontend
-    where the row came from so it can label the period column accordingly.
-    """
-    if not _is_approver(user):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Only HR / approvers can view the advances list.",
-        )
-
-    note_rows = (
-        db.query(MonthlyExpenseNote)
-        .join(User, MonthlyExpenseNote.user_id == User.id)
-        .filter(MonthlyExpenseNote.advance > 0)
-        .all()
-    )
-    expense_rows = (
-        db.query(Expense)
-        .join(User, Expense.user_id == User.id)
-        .filter(Expense.advance > 0)
-        .all()
-    )
-
-    items: list[dict] = []
-    for n in note_rows:
-        items.append({
-            "source": "monthly_note",
-            "user_id": n.user_id,
-            "user_name": _full_name(n.user) or "—",
-            "department": _dept_name(n.user) or "",
-            "year": n.year,
-            "month": n.month,
-            "advance": n.advance or 0,
-            "updated_at": n.updated_at.isoformat() if n.updated_at else None,
-        })
-    for e in expense_rows:
-        items.append({
-            "source": "expense",
-            "expense_id": e.id,
-            "user_id": e.user_id,
-            "user_name": _full_name(e.user) or "—",
-            "department": _dept_name(e.user) or "",
-            "year": e.date.year if e.date else None,
-            "month": e.date.month if e.date else None,
-            "advance": e.advance or 0,
-            # Use the expense's own date as the "Date of Given" — that's
-            # the day the advance was tied to.  Falls back to created_at
-            # so the row still sorts correctly when date is missing.
-            "updated_at": (
-                e.date.isoformat() if e.date
-                else (e.created_at.isoformat() if e.created_at else None)
-            ),
-            "expense_status": e.status,
-            "expense_type": e.expense_type or "",
-        })
-
-    # Newest first.  Missing timestamps go to the bottom.
-    items.sort(key=lambda it: (it.get("updated_at") or ""), reverse=True)
-    return {"items": items}
-
-
-@router.put("/monthly-notes")
-def upsert_monthly_note(
-    payload: dict = Body(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """HR-only: create or update a (user, year, month) note.
-
-    Body shape:
-        { "user_id": 17, "year": 2026, "month": 6,
-          "advance": 500, "remark": "On hold — awaiting director approval" }
-
-    Either `advance` or `remark` is optional but at least one should be
-    sent (sending both is fine).  Missing means "leave that field as-is".
-    """
-    if not _is_approver(user):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Only HR / approvers can edit monthly notes.",
-        )
-    try:
-        target_user_id = int(payload.get("user_id"))
-        year = int(payload.get("year"))
-        month = int(payload.get("month"))
-    except (TypeError, ValueError):
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "user_id, year, and month are required integers.",
-        )
-    if month < 1 or month > 12 or year < 2000 or year > 2100:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Invalid year/month: {year}/{month}",
-        )
-
-    # Find or create the note row.
-    note = (
-        db.query(MonthlyExpenseNote)
-        .filter(
-            MonthlyExpenseNote.user_id == target_user_id,
-            MonthlyExpenseNote.year == year,
-            MonthlyExpenseNote.month == month,
-        )
-        .first()
-    )
-    if note is None:
-        note = MonthlyExpenseNote(
-            user_id=target_user_id,
-            year=year,
-            month=month,
-            advance=0,
-            remark="",
-        )
-        db.add(note)
-
-    if "advance" in payload and payload["advance"] is not None:
-        try:
-            adv = max(0, int(float(payload["advance"])))
-        except (TypeError, ValueError):
-            adv = 0
-        note.advance = adv
-    if "remark" in payload and payload["remark"] is not None:
-        note.remark = str(payload["remark"])[:2048]
-    note.updated_by_id = user.id
-
-    db.commit()
-    db.refresh(note)
-    return _note_to_dict(note)
 
