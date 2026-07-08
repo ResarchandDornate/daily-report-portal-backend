@@ -24,6 +24,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     UniqueConstraint,
     text,
@@ -415,3 +416,58 @@ class SalesUpload(Base):
             f"<SalesUpload id={self.id} user_id={self.user_id} "
             f"file={self.original_filename!r}>"
         )
+
+
+class AdvanceRequest(Base):
+    """Employee travel-advance request, sent to HR for approval.
+
+    One request covers a single trip and may include multiple travellers
+    (stored as a JSONB array of name strings).  The summary table breaks
+    down the advance into accommodation, food, and local conveyance.
+    """
+
+    __tablename__ = "advance_requests"
+
+    id = Column(Integer, primary_key=True)
+    created_by_id = Column(Integer, ForeignKey("users_user.id"), nullable=False)
+
+    # Travellers — list of name strings (may include people not in the system)
+    employee_names = Column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+
+    # Trip header
+    city = Column(String(255), nullable=False, default="", server_default="")
+    travel_date = Column(Date, nullable=False)
+    return_date = Column(Date, nullable=False)
+    tour_days = Column(Integer, nullable=False, default=1, server_default="1")
+    mode_going = Column(String(100), nullable=False, default="", server_default="")
+    mode_return = Column(String(100), nullable=False, default="", server_default="")
+    purpose = Column(String(1024), nullable=False, default="", server_default="")
+
+    # Expense breakdown
+    accommodation_days = Column(Integer, nullable=False, default=0, server_default="0")
+    accommodation_rate = Column(Numeric(10, 2), nullable=False, default=0, server_default="0")
+    food_amount = Column(Numeric(10, 2), nullable=False, default=0, server_default="0")
+    conveyance_days = Column(Integer, nullable=False, default=0, server_default="0")
+    conveyance_rate = Column(Numeric(10, 2), nullable=False, default=0, server_default="0")
+    total_amount = Column(Numeric(10, 2), nullable=False, default=0, server_default="0")
+
+    # Approval
+    status = Column(String(20), nullable=False, default="pending", server_default="pending")
+    decision_note = Column(String(1024), nullable=False, default="", server_default="")
+    decided_by_id = Column(Integer, ForeignKey("users_user.id"), nullable=True)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    created_by = relationship("User", foreign_keys=[created_by_id])
+    decided_by = relationship("User", foreign_keys=[decided_by_id])
+
+    __table_args__ = (
+        Index("ix_advance_requests_created_by_id", "created_by_id"),
+        Index("ix_advance_requests_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AdvanceRequest id={self.id} status={self.status!r} total={self.total_amount}>"
