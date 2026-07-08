@@ -149,6 +149,7 @@ def _to_out(exp: Expense) -> ExpenseOut:
         paid_by_id=exp.paid_by_id,
         paid_by_name=_full_name(exp.paid_by),
         paid_at=exp.paid_at,
+        payment_ref=exp.payment_ref or "",
         created_at=exp.created_at,
     )
 
@@ -294,10 +295,8 @@ def list_expenses(
     - Regular employees see only their own expenses.
     """
     q = db.query(Expense).join(User, Expense.user_id == User.id)
-    if _is_approver(user):
-        pass  # see everything
-    elif _is_finance_approver(user):
-        q = q.filter(Expense.status.in_(("approved", "paid")))
+    if _is_approver(user) or _is_finance_approver(user):
+        pass  # see everything — finance approver needs full data for advance table
     else:
         q = q.filter(Expense.user_id == user.id)
     rows = q.order_by(Expense.created_at.desc()).limit(2000).all()
@@ -396,7 +395,7 @@ def list_advances(
     Returned items share a common shape; `source` tells the frontend
     where the row came from so it can label the period column accordingly.
     """
-    if not _is_approver(user):
+    if not (_is_approver(user) or _is_finance_approver(user)):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only HR / approvers can view the advances list.",
@@ -696,15 +695,13 @@ def decide_expense(
 @router.post("/{expense_id}/mark-paid", response_model=ExpenseOut)
 def mark_paid(
     expense_id: int,
+    payload: dict = Body(default={}),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Finance-approver-only: mark an approved expense as paid.
 
-    Terminal action — once marked paid, the row is locked (matches the
-    `Approved` / `Rejected` lock).  Only the finance approver (Shivangi)
-    can call this; HR / Tarini / Smita are NOT allowed because the audit
-    trail wants the disbursal step distinct from the approval decision.
+    Optional body: { "paid_date": "YYYY-MM-DD", "payment_ref": "UTR123..." }
     """
     if not _is_finance_approver(user):
         raise HTTPException(
@@ -721,7 +718,17 @@ def mark_paid(
         )
     exp.status = "paid"
     exp.paid_by_id = user.id
-    exp.paid_at = datetime.now(timezone.utc)
+    paid_date_str = (payload or {}).get("paid_date")
+    if paid_date_str:
+        try:
+            from datetime import date as date_cls
+            d = date_cls.fromisoformat(paid_date_str)
+            exp.paid_at = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            exp.paid_at = datetime.now(timezone.utc)
+    else:
+        exp.paid_at = datetime.now(timezone.utc)
+    exp.payment_ref = (payload or {}).get("payment_ref", "") or ""
     db.commit()
     db.refresh(exp)
     return _to_out(exp)

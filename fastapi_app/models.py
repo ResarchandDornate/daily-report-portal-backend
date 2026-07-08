@@ -297,6 +297,7 @@ class Expense(Base):
         nullable=True,
     )
     paid_at = Column(DateTime(timezone=True), nullable=True)
+    payment_ref = Column(String(255), nullable=False, default="", server_default="")
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

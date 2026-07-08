@@ -249,6 +249,7 @@ class ExpenseOut(BaseModel):
     paid_by_id: Optional[int] = None
     paid_by_name: str = ""
     paid_at: Optional[datetime] = None
+    payment_ref: str = ""
     created_at: datetime
 
     class Config:
