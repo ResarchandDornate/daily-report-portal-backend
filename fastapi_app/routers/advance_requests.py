@@ -18,7 +18,7 @@ from auth import get_current_user
 from database import get_db
 from models import AdvanceRequest, User
 
-router = APIRouter(prefix="/advance-requests", tags=["advance-requests"])
+router = APIRouter(prefix="/api/advance-requests", tags=["advance-requests"])
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -133,6 +133,43 @@ def list_advance_requests(
         q = q.filter(AdvanceRequest.created_by_id == me.id)
     rows = q.order_by(AdvanceRequest.created_at.desc()).all()
     return [_to_out(r) for r in rows]
+
+
+@router.patch("/{req_id}")
+def update_advance_request(
+    req_id: int,
+    body: AdvanceRequestIn,
+    db: Session = Depends(get_db),
+    me: User = Depends(get_current_user),
+):
+    """Owner-only edit of a pending advance request.  Once approved or
+    rejected the row is locked; HR can still delete via the DELETE route
+    if they need to clear a mistake."""
+    from datetime import date as date_type
+    req = db.get(AdvanceRequest, req_id)
+    if not req:
+        raise HTTPException(status_code=404, detail="Not found.")
+    if req.created_by_id != me.id:
+        raise HTTPException(status_code=403, detail="You can only edit your own advance requests.")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail="A decided request can no longer be edited.")
+    req.employee_names = body.employee_names
+    req.city = body.city
+    req.travel_date = date_type.fromisoformat(body.travel_date)
+    req.return_date = date_type.fromisoformat(body.return_date)
+    req.tour_days = body.tour_days
+    req.mode_going = body.mode_going
+    req.mode_return = body.mode_return
+    req.purpose = body.purpose
+    req.accommodation_days = body.accommodation_days
+    req.accommodation_rate = body.accommodation_rate
+    req.food_amount = body.food_amount
+    req.conveyance_days = body.conveyance_days
+    req.conveyance_rate = body.conveyance_rate
+    req.total_amount = body.total_amount
+    db.commit()
+    db.refresh(req)
+    return _to_out(req)
 
 
 @router.post("/{req_id}/decide")
