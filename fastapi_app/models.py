@@ -444,6 +444,12 @@ class AdvanceRequest(Base):
     mode_going = Column(String(100), nullable=False, default="", server_default="")
     mode_return = Column(String(100), nullable=False, default="", server_default="")
     purpose = Column(String(1024), nullable=False, default="", server_default="")
+    # Free-text name of the manager who sanctioned / requested the trip.
+    # Filled by the employee on the Apply modal so HR can trace who
+    # authorised the travel before approving the advance amount.
+    sent_by_manager = Column(
+        String(255), nullable=False, default="", server_default="",
+    )
 
     # Expense breakdown
     accommodation_days = Column(Integer, nullable=False, default=0, server_default="0")

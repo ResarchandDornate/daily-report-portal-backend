@@ -52,6 +52,7 @@ def _to_out(req: AdvanceRequest) -> dict:
         "mode_going": req.mode_going,
         "mode_return": req.mode_return,
         "purpose": req.purpose,
+        "sent_by_manager": req.sent_by_manager or "",
         "accommodation_days": req.accommodation_days,
         "accommodation_rate": float(req.accommodation_rate),
         "food_amount": float(req.food_amount),
@@ -77,6 +78,7 @@ class AdvanceRequestIn(BaseModel):
     mode_going: str
     mode_return: str
     purpose: str = ""
+    sent_by_manager: str = ""
     accommodation_days: int = 0
     accommodation_rate: float = 0
     food_amount: float = 0
@@ -109,6 +111,7 @@ def create_advance_request(
         mode_going=body.mode_going,
         mode_return=body.mode_return,
         purpose=body.purpose,
+        sent_by_manager=body.sent_by_manager,
         accommodation_days=body.accommodation_days,
         accommodation_rate=body.accommodation_rate,
         food_amount=body.food_amount,
@@ -161,6 +164,7 @@ def update_advance_request(
     req.mode_going = body.mode_going
     req.mode_return = body.mode_return
     req.purpose = body.purpose
+    req.sent_by_manager = body.sent_by_manager
     req.accommodation_days = body.accommodation_days
     req.accommodation_rate = body.accommodation_rate
     req.food_amount = body.food_amount
