@@ -250,6 +250,12 @@ class ExpenseOut(BaseModel):
     paid_by_name: str = ""
     paid_at: Optional[datetime] = None
     payment_ref: str = ""
+    # Amount actually disbursed — may be less than `advance` on a partial
+    # payment.  None until something has been paid out.
+    paid_amount: Optional[int] = None
+    # Free-text authoriser captured on the Issue Advance form.  Distinct from
+    # decided_by_name, which is derived from the linked approver account.
+    approved_by_name: str = ""
     created_at: datetime
 
     class Config:

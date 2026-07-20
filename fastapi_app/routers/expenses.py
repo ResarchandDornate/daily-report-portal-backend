@@ -54,11 +54,12 @@ APPROVER_EMAILS = {
     "smita@ornatesolar.com",
 }
 
-# Finance-team disbursal — only Shivangi can mark an approved expense as
+# Finance-team disbursal — these accounts can mark an approved expense as
 # "paid".  Same email-based gate as the approver set so the role doesn't
 # need to be remodelled.  Add more entries if Finance brings in cover.
 FINANCE_APPROVER_EMAILS = {
     "shivangi@ornatesolar.com",
+    "saif@ornatesolar.com",
 }
 
 # Allowed expense types — server-side enum so the frontend can't smuggle in
@@ -100,9 +101,9 @@ def _is_approver(user: User) -> bool:
 
 
 def _is_finance_approver(user: User) -> bool:
-    """Shivangi — the only account allowed to mark an approved expense
-    as paid.  Kept separate from the approval gate; she does NOT get to
-    approve/reject, only to disburse."""
+    """Finance team (Shivangi, Saif) — the accounts allowed to mark an
+    approved expense as paid.  Kept separate from the approval gate; they do
+    NOT get to approve/reject, only to disburse."""
     email = (user.email or "").strip().lower()
     return email in FINANCE_APPROVER_EMAILS
 
@@ -150,6 +151,8 @@ def _to_out(exp: Expense) -> ExpenseOut:
         paid_by_name=_full_name(exp.paid_by),
         paid_at=exp.paid_at,
         payment_ref=exp.payment_ref or "",
+        paid_amount=exp.paid_amount,
+        approved_by_name=exp.approved_by_name or "",
         created_at=exp.created_at,
     )
 
@@ -579,7 +582,13 @@ def advance_issue(
 ):
     """HR issues an advance to a specific employee.
 
-    Body: { "employee_id": int, "amount": int, "date": "YYYY-MM-DD" | null, "note": str | null }
+    Body: { "employee_id": int, "amount": int, "date": "YYYY-MM-DD" | null,
+            "note": str | null, "approved_by": str | null,
+            "paid_date": "YYYY-MM-DD" | null, "paid_amount": int | null }
+
+    Status follows what HR recorded: a paid_date means the money already went
+    out ("paid"); otherwise naming an authoriser marks it "approved"; with
+    neither it lands in the normal "pending" queue.
     """
     if not _is_approver(user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR / approvers can issue advances.")
@@ -593,15 +602,45 @@ def advance_issue(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee not found")
     raw_date = payload.get("date") or None
     note = str(payload.get("note") or "")[:500]
-    if raw_date:
+    approved_by = str(payload.get("approved_by") or "").strip()[:120]
+
+    from datetime import date as _date
+
+    def _parse_date(raw: str, label: str) -> _date:
         try:
-            from datetime import date as _date
-            exp_date = _date.fromisoformat(raw_date)
+            return _date.fromisoformat(raw)
         except ValueError:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "date must be YYYY-MM-DD")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, f"{label} must be YYYY-MM-DD"
+            )
+
+    exp_date = _parse_date(raw_date, "date") if raw_date else _date.today()
+
+    raw_paid_date = payload.get("paid_date") or None
+    paid_on = _parse_date(raw_paid_date, "paid_date") if raw_paid_date else None
+
+    paid_amount = None
+    if payload.get("paid_amount") not in (None, ""):
+        try:
+            paid_amount = int(float(payload.get("paid_amount")))
+        except (TypeError, ValueError):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "paid_amount must be an integer")
+        if paid_amount < 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "paid_amount must be non-negative")
+
+    if paid_on is not None:
+        # Money is recorded as already disbursed.  Default the paid amount to
+        # the full advance when HR didn't type a different figure.
+        new_status = "paid"
+        if paid_amount is None:
+            paid_amount = amount
+    elif approved_by:
+        new_status = "approved"
     else:
-        from datetime import date as _date
-        exp_date = _date.today()
+        new_status = "pending"
+        paid_amount = None
+
+    now = datetime.now(timezone.utc)
     exp = Expense(
         user_id=employee_id,
         expense_type="others",
@@ -612,7 +651,19 @@ def advance_issue(
         site_name="Advance issued",
         remarks=note,
         date=exp_date,
-        status="pending",
+        status=new_status,
+        approved_by_name=approved_by,
+        paid_amount=paid_amount,
+        # Stamp the audit trail so the row matches what a normal
+        # approve / mark-paid would have produced.
+        decided_by_id=user.id if new_status in ("approved", "paid") else None,
+        decided_at=now if new_status in ("approved", "paid") else None,
+        paid_by_id=user.id if new_status == "paid" else None,
+        paid_at=(
+            datetime(paid_on.year, paid_on.month, paid_on.day, tzinfo=timezone.utc)
+            if paid_on is not None
+            else None
+        ),
     )
     db.add(exp)
     db.commit()
@@ -631,7 +682,11 @@ def download_bill_at(
     exp = db.query(Expense).filter(Expense.id == expense_id).first()
     if not exp:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
-    if exp.user_id != user.id and not _is_approver(user):
+    if (
+        exp.user_id != user.id
+        and not _is_approver(user)
+        and not _is_finance_approver(user)
+    ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "You can't view this expense's bills"
         )
@@ -651,7 +706,11 @@ def download_bill_legacy(
     exp = db.query(Expense).filter(Expense.id == expense_id).first()
     if not exp:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
-    if exp.user_id != user.id and not _is_approver(user):
+    if (
+        exp.user_id != user.id
+        and not _is_approver(user)
+        and not _is_finance_approver(user)
+    ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "You can't view this expense's bills"
         )
@@ -741,8 +800,9 @@ def update_expense(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Owner edits their own expense.  Only allowed while the expense is
-    still pending or on hold; once approved / rejected the row is locked.
+    """Owner edits their own expense.  Allowed while the expense is pending,
+    on hold, or rejected — editing a rejected row resubmits it (see below).
+    Once approved / paid the row is locked.
 
     Bills attached to the expense are NOT touched here — bill add/remove
     flows go through the upload + delete endpoints.
@@ -755,10 +815,10 @@ def update_expense(
             status.HTTP_403_FORBIDDEN,
             "You can only edit your own expenses (HR can edit any).",
         )
-    if exp.status not in ("pending", "onhold"):
+    if exp.status not in ("pending", "onhold", "rejected"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "This expense has already been decided and can no longer be edited.",
+            "This expense has already been approved and can no longer be edited.",
         )
 
     # Apply each provided field with the same validation rules as create.
@@ -807,9 +867,10 @@ def update_expense(
     if payload.remarks is not None:
         exp.remarks = (payload.remarks or "").strip()
 
-    # Editing an on-hold expense bumps it back to pending so the approver
-    # sees a fresh request to review.  Reset the prior decision metadata too.
-    if exp.status == "onhold":
+    # Editing an on-hold or rejected expense resubmits it: back to pending so
+    # the approver sees a fresh request to review.  The prior decision (and the
+    # rejection note explaining what to fix) is cleared along with it.
+    if exp.status in ("onhold", "rejected"):
         exp.status = "pending"
         exp.decided_by_id = None
         exp.decided_at = None
@@ -851,13 +912,15 @@ def delete_expense(
 
 
 def _assert_can_edit_bills(exp: Expense, user: User) -> None:
-    """Same gate as PATCH /expenses/{id} — owner or HR, status pending/onhold."""
+    """Same gate as PATCH /expenses/{id} — owner or HR, status pending/onhold/
+    rejected.  Rejected is allowed so the employee can attach the bill they
+    were asked for before resubmitting."""
     if exp.user_id != user.id and not _is_hr(user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "You can only manage bills on your own expenses (HR can edit any).",
         )
-    if exp.status not in ("pending", "onhold"):
+    if exp.status not in ("pending", "onhold", "rejected"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "This expense has already been decided and its bills are locked.",

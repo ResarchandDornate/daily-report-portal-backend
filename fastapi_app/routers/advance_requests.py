@@ -33,6 +33,17 @@ def _is_approver(user: User) -> bool:
     )
 
 
+def _is_finance_viewer(user: User) -> bool:
+    """Finance (Shivangi, Saif) — read-only visibility of every advance
+    request.  They disburse the money so they need the full picture, but
+    they do not approve/reject or delete."""
+    local = (user.email or "").lower().split("@")[0]
+    return any(
+        local == p or local.startswith(p + ".") or local.startswith(p + "_")
+        for p in ("shivangi", "saif")
+    )
+
+
 def _full_name(u: User | None) -> str:
     if not u:
         return ""
@@ -132,7 +143,7 @@ def list_advance_requests(
     me: User = Depends(get_current_user),
 ):
     q = db.query(AdvanceRequest)
-    if not _is_approver(me):
+    if not (_is_approver(me) or _is_finance_viewer(me)):
         q = q.filter(AdvanceRequest.created_by_id == me.id)
     rows = q.order_by(AdvanceRequest.created_at.desc()).all()
     return [_to_out(r) for r in rows]

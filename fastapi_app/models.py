@@ -299,6 +299,16 @@ class Expense(Base):
     )
     paid_at = Column(DateTime(timezone=True), nullable=True)
     payment_ref = Column(String(255), nullable=False, default="", server_default="")
+    # Amount actually disbursed.  Kept separate from `advance` because a
+    # partial payment is allowed (advance ₹5,000, paid ₹4,000).  NULL means
+    # nothing has been paid out yet.
+    paid_amount = Column(Integer, nullable=True)
+    # Free-text record of who authorised the advance, captured on the "Issue
+    # Advance" form.  Unlike decided_by_id this is not linked to an account —
+    # it exists for advances authorised outside the normal approval flow.
+    approved_by_name = Column(
+        String(120), nullable=False, default="", server_default=""
+    )
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
