@@ -36,6 +36,7 @@ from fastapi import (
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 import storage
@@ -106,6 +107,40 @@ def _is_finance_approver(user: User) -> bool:
     NOT get to approve/reject, only to disburse."""
     email = (user.email or "").strip().lower()
     return email in FINANCE_APPROVER_EMAILS
+
+
+# Project coordinators — read-only visibility into a fixed set of team members'
+# expenses + advances.  A coordinator is NOT an approver: they can see their
+# team's rows but cannot approve / reject / hold / mark-paid.  Map each
+# coordinator email to the exact set of team-member emails they may view.
+PROJECT_COORDINATORS = {
+    "arman@ornatesolar.com": {
+        "vijay@ornatesolar.com",      # Vijay Kumar Pal
+        "anil@ornatesolar.com",       # Anil Pathak
+        "indra@ornatesolar.com",      # Indra Kumar
+        "imran@ornatesolar.com",      # Imran Khan
+        "biswanath@ornatesolar.com",  # Biswanath Nandi
+        "afroj@ornatesolar.com",      # Afroj Alam
+        "asim@ornatesolar.com",       # Asim Equbal
+        "manoj2@ornatesolar.com",     # Manoj Kumar Yadav
+    },
+}
+
+
+def _coordinator_team(user: User) -> set[str] | None:
+    """The set of team-member emails this coordinator may view, or None if the
+    user is not a project coordinator."""
+    email = (user.email or "").strip().lower()
+    return PROJECT_COORDINATORS.get(email)
+
+
+def _coordinator_may_view(user: User, exp: Expense, db: Session) -> bool:
+    """True if `user` is a coordinator and `exp` belongs to one of their team."""
+    team = _coordinator_team(user)
+    if not team:
+        return False
+    owner = db.get(User, exp.user_id)
+    return owner is not None and (owner.email or "").strip().lower() in team
 
 
 def _full_name(u: User | None) -> str:
@@ -295,11 +330,16 @@ def list_expenses(
     - Finance approvers (Shivangi) see ONLY `approved` + `paid` rows —
       pending / onhold / rejected expenses are filtered out so her view
       is just her disbursal queue + history.
+    - Project coordinators (Arman) see ONLY their team members' expenses.
     - Regular employees see only their own expenses.
     """
     q = db.query(Expense).join(User, Expense.user_id == User.id)
+    team = _coordinator_team(user)
     if _is_approver(user) or _is_finance_approver(user):
         pass  # see everything — finance approver needs full data for advance table
+    elif team is not None:
+        # Read-only: restrict to the coordinator's team by member email.
+        q = q.filter(func.lower(User.email).in_(team))
     else:
         q = q.filter(Expense.user_id == user.id)
     rows = q.order_by(Expense.created_at.desc()).limit(2000).all()
@@ -686,6 +726,7 @@ def download_bill_at(
         exp.user_id != user.id
         and not _is_approver(user)
         and not _is_finance_approver(user)
+        and not _coordinator_may_view(user, exp, db)
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "You can't view this expense's bills"
@@ -710,6 +751,7 @@ def download_bill_legacy(
         exp.user_id != user.id
         and not _is_approver(user)
         and not _is_finance_approver(user)
+        and not _coordinator_may_view(user, exp, db)
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "You can't view this expense's bills"

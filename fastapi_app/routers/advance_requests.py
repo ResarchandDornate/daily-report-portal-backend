@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -42,6 +43,21 @@ def _is_finance_viewer(user: User) -> bool:
         local == p or local.startswith(p + ".") or local.startswith(p + "_")
         for p in ("shivangi", "saif")
     )
+
+
+# Project coordinators — read-only visibility into a fixed team's advance
+# requests.  Kept in sync with PROJECT_COORDINATORS in routers/expenses.py.
+PROJECT_COORDINATORS = {
+    "arman@ornatesolar.com": {
+        "vijay@ornatesolar.com", "anil@ornatesolar.com", "indra@ornatesolar.com",
+        "imran@ornatesolar.com", "biswanath@ornatesolar.com", "afroj@ornatesolar.com",
+        "asim@ornatesolar.com", "manoj2@ornatesolar.com",
+    },
+}
+
+
+def _coordinator_team(user: User) -> set[str] | None:
+    return PROJECT_COORDINATORS.get((user.email or "").strip().lower())
 
 
 def _full_name(u: User | None) -> str:
@@ -143,7 +159,17 @@ def list_advance_requests(
     me: User = Depends(get_current_user),
 ):
     q = db.query(AdvanceRequest)
-    if not (_is_approver(me) or _is_finance_viewer(me)):
+    team = _coordinator_team(me)
+    if _is_approver(me) or _is_finance_viewer(me):
+        pass  # full visibility
+    elif team is not None:
+        # Read-only: only this coordinator's team members' advance requests.
+        member_ids = [
+            uid for (uid,) in db.query(User.id)
+            .filter(func.lower(User.email).in_(team)).all()
+        ]
+        q = q.filter(AdvanceRequest.created_by_id.in_(member_ids or [-1]))
+    else:
         q = q.filter(AdvanceRequest.created_by_id == me.id)
     rows = q.order_by(AdvanceRequest.created_at.desc()).all()
     return [_to_out(r) for r in rows]

@@ -5,8 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+psycopg://drp_user:drp@postgres:5432/drp",
+   
 )
 # Allow either "postgresql://" (Django-style) or "postgresql+psycopg://"
 if DATABASE_URL.startswith("postgresql://"):
