@@ -338,8 +338,11 @@ def list_expenses(
     if _is_approver(user) or _is_finance_approver(user):
         pass  # see everything — finance approver needs full data for advance table
     elif team is not None:
-        # Read-only: restrict to the coordinator's team by member email.
-        q = q.filter(func.lower(User.email).in_(team))
+        # The coordinator's team (read-only) PLUS their own expenses, so they
+        # can still file and view their own under "My Expenses".
+        q = q.filter(
+            (func.lower(User.email).in_(team)) | (Expense.user_id == user.id)
+        )
     else:
         q = q.filter(Expense.user_id == user.id)
     rows = q.order_by(Expense.created_at.desc()).limit(2000).all()

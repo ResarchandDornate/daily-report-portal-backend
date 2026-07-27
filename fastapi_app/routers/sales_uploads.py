@@ -11,7 +11,7 @@ Workflow:
   4. DELETE /api/sales-uploads/{id}  — HR or the uploading employee can
                                         remove an upload.
 
-Only Inside Sales department employees may upload.  HR has full read/delete.
+Only Inside Sales / Sales Service / Sales department employees may upload.  HR has full read/delete.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from fastapi import (
     status,
 )
 from openpyxl import load_workbook
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 import storage
 from auth import get_current_user
@@ -43,8 +43,9 @@ router = APIRouter(prefix="/api/sales-uploads", tags=["sales-uploads"])
 
 # Slugs whose employees are allowed to upload calling/billing sheets.
 # Inside Sales does outbound call logs; Sales Service (Manisha's team) handles
-# customer follow-ups + DPRs and benefits from the same upload+preview UX.
-UPLOAD_DEPT_SLUGS = {"insideSales", "salesService"}
+# customer follow-ups + DPRs; Sales (the general field-sales department) gets
+# the same upload+preview UX for their own calling/report sheets.
+UPLOAD_DEPT_SLUGS = {"insideSales", "salesService", "sales"}
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB cap — calling sheets are tiny CSV-ish files
 ALLOWED_EXTENSIONS = {".xlsx", ".xlsm"}
 
@@ -173,14 +174,22 @@ def _cell_to_dict(cell) -> dict:
 def _to_out(upload: SalesUpload) -> SalesUploadOut:
     """Hydrate a SalesUpload row into the response schema with user_name."""
     name = ""
+    dept_slug = ""
+    dept_name = ""
     if upload.user:
         first = (upload.user.first_name or "").strip()
         last = (upload.user.last_name or "").strip()
         name = (first + " " + last).strip() or upload.user.username
+        dept = getattr(upload.user, "department", None)
+        if dept is not None:
+            dept_slug = dept.slug or ""
+            dept_name = dept.name or ""
     return SalesUploadOut(
         id=upload.id,
         user_id=upload.user_id,
         user_name=name,
+        user_department_slug=dept_slug,
+        user_department_name=dept_name,
         period_type=upload.period_type,
         period_start=upload.period_start,
         period_end=upload.period_end,
@@ -286,7 +295,11 @@ def list_uploads(
     user: User = Depends(get_current_user),
 ):
     """List uploads.  HR sees everything; an Inside Sales employee sees own only."""
-    q = db.query(SalesUpload).order_by(SalesUpload.uploaded_at.desc())
+    q = (
+        db.query(SalesUpload)
+        .options(joinedload(SalesUpload.user).joinedload(User.department))
+        .order_by(SalesUpload.uploaded_at.desc())
+    )
     if not _is_hr(user):
         if not _can_upload_sales(user):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed.")

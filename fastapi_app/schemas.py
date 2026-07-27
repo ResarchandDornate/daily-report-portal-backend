@@ -195,6 +195,8 @@ class SalesUploadOut(BaseModel):
     id: int
     user_id: int
     user_name: str = ""
+    user_department_slug: str = ""
+    user_department_name: str = ""
     period_type: str
     period_start: Optional[date_type] = None
     period_end: Optional[date_type] = None
