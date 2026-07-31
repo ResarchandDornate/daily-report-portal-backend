@@ -633,7 +633,7 @@ def advance_issue(
     out ("paid"); otherwise naming an authoriser marks it "approved"; with
     neither it lands in the normal "pending" queue.
     """
-    if not _is_approver(user):
+    if not (_is_approver(user) or _is_finance_approver(user)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR / approvers can issue advances.")
     try:
         employee_id = int(payload.get("employee_id") or 0)

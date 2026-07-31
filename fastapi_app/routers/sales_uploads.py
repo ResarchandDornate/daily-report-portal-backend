@@ -59,6 +59,21 @@ def _is_hr(user: User) -> bool:
     return user.role == "hr"
 
 
+def _managed_dept_id(user: User):
+    """Department a team head manages — the explicit `team_head_dept_id` when
+    set, otherwise their own department.  None if they aren't a team head."""
+    if not bool(getattr(user, "is_team_head", False)):
+        return None
+    return getattr(user, "team_head_dept_id", None) or user.department_id
+
+
+def _can_manage(user: User, target: User) -> bool:
+    """True if `user` (a team head) may act for `target` — i.e. the target is
+    an employee in the department this team head manages."""
+    managed = _managed_dept_id(user)
+    return managed is not None and target is not None and target.department_id == managed
+
+
 def _parse_xlsx_summary(xlsx_bytes: bytes, max_rows_preview: int = 30) -> dict:
     """Open the workbook with openpyxl and pull a compact summary:
       - sheet name + dimensions
@@ -208,15 +223,35 @@ async def create_upload(
     period_start: str | None = Form(None),  # YYYY-MM-DD
     period_end: str | None = Form(None),
     note: str = Form(""),
+    on_behalf_of: int | None = Form(None),  # target employee id (team head / HR)
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     # ----- Authorization -----
-    if not (_can_upload_sales(user) or _is_hr(user)):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Only Inside Sales / Sales Service employees (or HR) can upload sales sheets.",
-        )
+    # Who the upload is attributed to.  Defaults to the uploader; a team head
+    # or HR may upload on behalf of another employee via `on_behalf_of`.
+    owner = user
+    if on_behalf_of is not None and on_behalf_of != user.id:
+        target = db.query(User).filter(User.id == on_behalf_of).first()
+        if not target:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"No user with id={on_behalf_of}"
+            )
+        # HR can upload for anyone; a team head only for members of their
+        # managed department.
+        if not (_is_hr(user) or _can_manage(user, target)):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "You don't have permission to upload sheets for this employee.",
+            )
+        owner = target
+    else:
+        # Self-upload — restricted to Sales-family employees and HR.
+        if not (_can_upload_sales(user) or _is_hr(user)):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Only Inside Sales / Sales Service employees (or HR) can upload sales sheets.",
+            )
 
     # ----- File validation -----
     filename = file.filename or "upload.xlsx"
@@ -261,7 +296,7 @@ async def create_upload(
 
     # ----- Push to MinIO -----
     today = date_type.today().isoformat()
-    object_key = f"sales/{user.id}/{today}/{uuid.uuid4().hex}-{filename}"
+    object_key = f"sales/{owner.id}/{today}/{uuid.uuid4().hex}-{filename}"
     storage.put_object(
         object_key,
         data,
@@ -272,7 +307,7 @@ async def create_upload(
 
     # ----- Persist DB row -----
     upload = SalesUpload(
-        user_id=user.id,
+        user_id=owner.id,
         period_type=period_type,
         period_start=p_start,
         period_end=p_end,
@@ -294,16 +329,28 @@ def list_uploads(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """List uploads.  HR sees everything; an Inside Sales employee sees own only."""
+    """List uploads.  HR sees everything; a team head sees every upload for
+    their managed department (plus their own); a Sales employee sees own only."""
     q = (
         db.query(SalesUpload)
         .options(joinedload(SalesUpload.user).joinedload(User.department))
         .order_by(SalesUpload.uploaded_at.desc())
     )
     if not _is_hr(user):
-        if not _can_upload_sales(user):
+        managed = _managed_dept_id(user)
+        if managed is not None:
+            # Team head: uploads owned by anyone in the managed department, plus
+            # any the team head uploaded themselves.
+            member_ids = [
+                row.id
+                for row in db.query(User.id).filter(User.department_id == managed).all()
+            ]
+            member_ids.append(user.id)
+            q = q.filter(SalesUpload.user_id.in_(member_ids))
+        elif _can_upload_sales(user):
+            q = q.filter(SalesUpload.user_id == user.id)
+        else:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed.")
-        q = q.filter(SalesUpload.user_id == user.id)
     return [_to_out(u) for u in q.all()]
 
 
@@ -324,7 +371,7 @@ def download_upload(
     if not upload:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upload not found")
 
-    if not _is_hr(user) and upload.user_id != user.id:
+    if not (_is_hr(user) or upload.user_id == user.id or _can_manage(user, upload.user)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed.")
 
     try:
@@ -359,7 +406,7 @@ def delete_upload(
     if not upload:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Upload not found")
 
-    if not _is_hr(user) and upload.user_id != user.id:
+    if not (_is_hr(user) or upload.user_id == user.id or _can_manage(user, upload.user)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed.")
 
     storage.delete_object(upload.minio_object_key)
