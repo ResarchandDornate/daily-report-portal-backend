@@ -22,6 +22,30 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 _INVALID_SHEET_CHARS = set(r":\/?*[]")
 
 
+def _scope_reports_to_caller(q, user: User, db: Session):
+    """Restrict a DailyReport query to what `user` is allowed to see.
+
+    Mirrors the on-behalf-of permission model `upsert_report` already
+    enforces for writes: HR sees everyone; a team head sees their managed
+    department; everyone else sees only their own reports. Applied BEFORE
+    any caller-supplied `employee`/`department` filter, so those filters can
+    only narrow within the allowed scope, never widen past it — a request
+    for someone outside scope just comes back empty instead of leaking data.
+
+    Previously `list_reports` had no scoping at all beyond "is logged in",
+    so any authenticated employee (including a fresh self-signup) could read
+    every other employee's daily reports company-wide.
+    """
+    if user.role == "hr":
+        return q
+    is_team_head = bool(getattr(user, "is_team_head", False))
+    managed_dept_id = getattr(user, "team_head_dept_id", None) or user.department_id
+    if is_team_head and managed_dept_id is not None:
+        allowed_ids = db.query(User.id).filter(User.department_id == managed_dept_id)
+        return q.filter(DailyReport.user_id.in_(allowed_ids))
+    return q.filter(DailyReport.user_id == user.id)
+
+
 def _sanitize_sheet_name(name: str) -> str:
     cleaned = "".join("_" if c in _INVALID_SHEET_CHARS else c for c in (name or "Sheet"))
     cleaned = cleaned.strip() or "Sheet"
@@ -94,9 +118,9 @@ def list_reports(
     limit: int = Query(1000, ge=1, le=5000, description="Page size"),
     offset: int = Query(0, ge=0, description="Rows to skip"),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    q = db.query(DailyReport)
+    q = _scope_reports_to_caller(db.query(DailyReport), user, db)
     if employee is not None:
         q = q.filter(DailyReport.user_id == employee)
     if department:
@@ -382,7 +406,7 @@ def export_xlsx(
     start: date_type | None = Query(None, description="Inclusive start date"),
     end: date_type | None = Query(None, description="Inclusive end date"),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Styled Excel export — Summary sheet first, one sheet per department.
 
@@ -391,7 +415,13 @@ def export_xlsx(
     empty cells.  Numeric report fields are summed across the date range;
     text fields are concatenated as `date: value` lines.  Each employee
     appears on exactly one row per sheet.
+
+    HR-only: this is a company-wide, cross-employee export and both frontend
+    callers (`/dashboard/reports`, `/dashboard/summary`) are already HR-only
+    pages — the API just didn't enforce that itself before.
     """
+    if user.role != "hr":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR can export the company-wide report.")
     q = db.query(DailyReport).join(User, DailyReport.user_id == User.id)
     if employee is not None:
         q = q.filter(DailyReport.user_id == employee)
@@ -3441,7 +3471,7 @@ def export_csv(
     start: date_type | None = Query(None, description="Inclusive start date"),
     end: date_type | None = Query(None, description="Inclusive end date"),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Single-file CSV mirror of the styled XLSX summary.
 
@@ -3450,7 +3480,11 @@ def export_csv(
     Key Activities lines are joined with " | " so each row stays on one line
     in spreadsheet apps that don't auto-wrap.  UTF-8 with BOM so Excel
     detects the encoding correctly on Windows.
+
+    HR-only — same reasoning as export_xlsx above.
     """
+    if user.role != "hr":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR can export the company-wide report.")
     q = db.query(DailyReport).join(User, DailyReport.user_id == User.id)
     if employee is not None:
         q = q.filter(DailyReport.user_id == employee)
