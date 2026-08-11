@@ -73,7 +73,7 @@ ALLOWED_EXPENSE_TYPES = {
     "officereimburse", "sitematerial", "officematerial",
 }
 ALLOWED_TRAVEL_TYPES = {
-    "bus", "cab", "bike", "rapido", "car", "auto", "metro", "rickshaw", "other",
+    "bus", "cab", "ola", "uber", "bike", "rapido", "car", "auto", "metro", "rickshaw", "other",
 }
 ALLOWED_MODES = {"cash", "upi", "card", "bank", "other", ""}
 
