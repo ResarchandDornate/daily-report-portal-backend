@@ -723,7 +723,14 @@ def advance_issue(
     out ("paid"); otherwise naming an authoriser marks it "approved"; with
     neither it lands in the normal "pending" queue.
     """
-    if not (_is_approver(user) or _is_finance_approver(user)):
+    # HR / approvers / finance issue advances anywhere; a department-scoped
+    # expense delegate (e.g. Reception for Sales) may RECORD one for their
+    # department — it always lands "pending" (see below), never approved/paid.
+    is_delegate_only = (
+        not (_is_approver(user) or _is_finance_approver(user))
+        and _delegate_dept_slug(user) is not None
+    )
+    if not (_is_approver(user) or _is_finance_approver(user) or is_delegate_only):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only HR / approvers can issue advances.")
     try:
         employee_id = int(payload.get("employee_id") or 0)
@@ -733,6 +740,15 @@ def advance_issue(
     target = db.get(User, employee_id)
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Employee not found")
+    if is_delegate_only:
+        # Strict department check — deliberately NOT _can_file_for, which
+        # would also allow self; a delegate must not self-issue advances.
+        dept = getattr(target, "department", None)
+        if not (dept is not None and dept.slug == _delegate_dept_slug(user)):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "You can only add advances for employees of your delegated department.",
+            )
     raw_date = payload.get("date") or None
     note = str(payload.get("note") or "")[:500]
     approved_by = str(payload.get("approved_by") or "").strip()[:120]
@@ -760,6 +776,13 @@ def advance_issue(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "paid_amount must be an integer")
         if paid_amount < 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "paid_amount must be non-negative")
+
+    if is_delegate_only:
+        # Delegate-recorded advances always enter the queue as pending —
+        # only HR / finance may mark money approved or disbursed.
+        approved_by = ""
+        paid_on = None
+        paid_amount = None
 
     if paid_on is not None:
         # Money is recorded as already disbursed.  Default the paid amount to
