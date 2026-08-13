@@ -42,7 +42,7 @@ from sqlalchemy.orm import Session
 import storage
 from auth import get_current_user
 from database import get_db
-from models import Expense, MonthlyExpenseNote, User
+from models import Department, Expense, MonthlyExpenseNote, User
 from schemas import ExpenseBillOut, ExpenseDecideIn, ExpenseOut, ExpensePatchIn
 
 
@@ -61,6 +61,15 @@ APPROVER_EMAILS = {
 FINANCE_APPROVER_EMAILS = {
     "shivangi@ornatesolar.com",
     "saif@ornatesolar.com",
+}
+
+# Department-scoped expense delegates — reception/admin staff who may FILE
+# (and later fix) expenses ON BEHALF OF the employees of one department,
+# without any approve / reject / disbursal powers.  The created expense is
+# OWNED by the target employee, so approval and payout flow exactly as if
+# they had filed it themselves.  email → department slug.
+EXPENSE_DELEGATE_EMAILS = {
+    "nitika@ornatesolar.com": "sales",   # Reception files for the Sales team
 }
 
 # Allowed expense types — server-side enum so the frontend can't smuggle in
@@ -91,6 +100,26 @@ ALLOWED_BILL_MIMETYPES = {
 
 def _is_hr(user: User) -> bool:
     return user.role == "hr"
+
+
+def _delegate_dept_slug(user: User) -> str | None:
+    """Department slug this user may file expenses for, or None."""
+    return EXPENSE_DELEGATE_EMAILS.get((user.email or "").strip().lower())
+
+
+def _can_file_for(user: User, target: User | None) -> bool:
+    """May `user` create / edit expenses OWNED by `target`?
+
+    Owner and HR always can; an expense delegate can when the target
+    belongs to the department they are scoped to.
+    """
+    if target is None:
+        return False
+    if target.id == user.id or _is_hr(user):
+        return True
+    slug = _delegate_dept_slug(user)
+    dept = getattr(target, "department", None)
+    return slug is not None and dept is not None and dept.slug == slug
 
 
 def _is_approver(user: User) -> bool:
@@ -208,10 +237,29 @@ async def create_expense(
     # uses it; that file is appended after `bills`.
     bills: list[UploadFile] = File(default=[]),
     bill: UploadFile | None = File(None),
+    on_behalf_of: int | None = Form(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Employee creates a new expense.  Multiple bill files are supported."""
+    # ----- Ownership -----
+    # Defaults to the caller.  HR or a department-scoped delegate (e.g.
+    # Reception filing for the Sales team) may create the expense for
+    # someone else via `on_behalf_of`; the row is owned by the target
+    # employee so approval and payout flow as if they filed it themselves.
+    owner = user
+    if on_behalf_of is not None and on_behalf_of != user.id:
+        target = db.query(User).filter(User.id == on_behalf_of).first()
+        if not target:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"No user with id={on_behalf_of}"
+            )
+        if not _can_file_for(user, target):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "You don't have permission to file expenses for this employee.",
+            )
+        owner = target
     expense_type = (expense_type or "").strip().lower()
     travel_type = (travel_type or "").strip().lower()
     mode = (mode or "").strip().lower()
@@ -301,7 +349,7 @@ async def create_expense(
         stored_bills.append({"filename": f.filename, "object_key": object_key})
 
     exp = Expense(
-        user_id=user.id,
+        user_id=owner.id,
         date=date,
         mode=mode,
         expense_type=expense_type,
@@ -343,10 +391,52 @@ def list_expenses(
         q = q.filter(
             (func.lower(User.email).in_(team)) | (Expense.user_id == user.id)
         )
+    elif (dslug := _delegate_dept_slug(user)) is not None:
+        # Expense delegate — sees their scoped department's expenses (to
+        # file and fix them) plus their own.  No decide powers.
+        q = q.outerjoin(Department, User.department_id == Department.id).filter(
+            (Department.slug == dslug) | (Expense.user_id == user.id)
+        )
     else:
         q = q.filter(Expense.user_id == user.id)
     rows = q.order_by(Expense.created_at.desc()).limit(2000).all()
     return [_to_out(r) for r in rows]
+
+
+@router.get("/delegate/employees")
+def delegate_employees(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Employees the caller may file expenses for (delegate scope).
+
+    Non-delegates get an empty scope (not a 403) so the frontend can call
+    this unconditionally and cheaply decide whether to show the
+    "Filing for" picker on the expense form.
+    """
+    slug = _delegate_dept_slug(user)
+    if slug is None:
+        return {"department": None, "employees": []}
+    dept = db.query(Department).filter(Department.slug == slug).first()
+    if not dept:
+        return {"department": None, "employees": []}
+    rows = (
+        db.query(User)
+        .filter(User.department_id == dept.id, User.is_active.is_(True))
+        .order_by(User.first_name, User.username)
+        .all()
+    )
+    return {
+        "department": {"slug": dept.slug, "name": dept.name},
+        "employees": [
+            {
+                "id": u.id,
+                "name": (f"{u.first_name} {u.last_name}".strip() or u.username),
+                "email": u.email,
+            }
+            for u in rows
+        ],
+    }
 
 
 def _serve_bill(exp: Expense, bill: dict) -> Response:
@@ -855,10 +945,11 @@ def update_expense(
     exp = db.query(Expense).filter(Expense.id == expense_id).first()
     if not exp:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
-    if exp.user_id != user.id and not _is_hr(user):
+    if not _can_file_for(user, exp.user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "You can only edit your own expenses (HR can edit any).",
+            "You can only edit your own expenses (HR can edit any; a "
+            "delegate only their department's).",
         )
     if exp.status not in ("pending", "onhold", "rejected"):
         raise HTTPException(
@@ -960,10 +1051,11 @@ def _assert_can_edit_bills(exp: Expense, user: User) -> None:
     """Same gate as PATCH /expenses/{id} — owner or HR, status pending/onhold/
     rejected.  Rejected is allowed so the employee can attach the bill they
     were asked for before resubmitting."""
-    if exp.user_id != user.id and not _is_hr(user):
+    if not _can_file_for(user, exp.user):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "You can only manage bills on your own expenses (HR can edit any).",
+            "You can only manage bills on your own expenses (HR can edit "
+            "any; a delegate only their department's).",
         )
     if exp.status not in ("pending", "onhold", "rejected"):
         raise HTTPException(
